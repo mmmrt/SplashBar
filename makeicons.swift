@@ -177,7 +177,7 @@ func emit(_ name: String, _ px: Int, _ draw: (CGContext) -> Void) {
     print("  \(name)  (\(px)px)")
 }
 
-print("生成菜单栏图标:")
+print("generating menu-bar icons:")
 for (state, label) in [(MenuState.running, "running"),
                        (MenuState.paused, "paused"),
                        (MenuState.stopped, "stopped")] {
@@ -186,7 +186,7 @@ for (state, label) in [(MenuState.running, "running"),
     emit("menubar_\(label)@3x.png", 54) { drawMenuIcon($0, state) }
 }
 
-print("生成应用图标 iconset:")
+print("generating app icon iconset:")
 let iconset = "\(outDir)/AppIcon.iconset"
 try? fm.createDirectory(atPath: iconset, withIntermediateDirectories: true)
 let sizes: [(String, Int)] = [
@@ -202,7 +202,7 @@ for (name, px) in sizes {
     guard let img = ctx.makeImage() else { continue }
     writePNG(img, "\(iconset)/\(name)")
 }
-print("  AppIcon.iconset/ (\(sizes.count) 个尺寸)")
+print("  AppIcon.iconset/ (\(sizes.count) sizes)")
 
 // MARK: - 预览图（仅用于人工核对，不进 App 包）
 

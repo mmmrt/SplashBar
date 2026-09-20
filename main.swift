@@ -1,0 +1,1070 @@
+//  SplashBar — macOS 菜单栏常驻控制器，用于管理 Splash 推理服务的启动参数与启停。
+//  纯 AppKit 实现（无窗口、无 Dock 图标）。
+//  服务以独立会话（setsid）子进程方式拉起，菜单栏 App 退出后服务继续运行。
+//  登录自启通过 SMAppService 注册本 App 实现（不走 launchd，避开本机 bootstrap 被拒的问题）。
+
+import AppKit
+import Foundation
+import ServiceManagement
+
+// MARK: - 常量与路径
+
+private let kSplashBin = "/opt/homebrew/bin/splash"
+private let kBaseURL   = "http://127.0.0.1:8000"
+private let kPort      = "8000"
+
+// libproc 常量（直接给字面量，避免依赖 C 宏是否被 Swift 桥接）
+private let kProcPidTBSDInfo: Int32 = 3   // PROC_PIDTBSDINFO（实测返回 136 = sizeof(proc_bsdinfo)）
+// sys/proc.h: SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
+// 注意 SSTOP 是 4，写成 3(SSLEEP) 会导致暂停永远检测不到
+private let kSSTOP: UInt32 = 4
+
+private func homeURL() -> URL { FileManager.default.homeDirectoryForCurrentUser }
+
+private var appSupportDir: URL { homeURL().appendingPathComponent("Library/Application Support/SplashBar") }
+private var configURL:     URL { appSupportDir.appendingPathComponent("config.json") }
+private var pidURL:        URL { appSupportDir.appendingPathComponent("splash.pid") }
+private var logOutPath: String { homeURL().appendingPathComponent("Library/Logs/splashbar.out.log").path }
+private var logErrPath: String { homeURL().appendingPathComponent("Library/Logs/splashbar.err.log").path }
+private var splashModelsDir: URL {
+    homeURL().appendingPathComponent("Library/Application Support/Splash/models")
+}
+
+// MARK: - 配置
+
+final class Config: Codable {
+    var model: String = "incoai/Qwen3.8-27B-Splash"
+    var maxMemory: String = "auto"
+    var maxContext: String = "auto"
+    var apiKey: String = ""
+    var allowedHost: String = ""
+    var noWebUI: Bool = false
+    var loginItem: Bool = false
+    var autoStartOnLaunch: Bool = false
+    /// 菜单栏图标右侧是否显示模型名
+    var showModelName: Bool = true
+
+    /// 手写解码：任一字段缺失（老版本配置文件）都退回默认值，不整体丢弃配置
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model             = (try? c.decode(String.self, forKey: .model)) ?? model
+        maxMemory         = (try? c.decode(String.self, forKey: .maxMemory)) ?? maxMemory
+        maxContext        = (try? c.decode(String.self, forKey: .maxContext)) ?? maxContext
+        apiKey            = (try? c.decode(String.self, forKey: .apiKey)) ?? apiKey
+        allowedHost       = (try? c.decode(String.self, forKey: .allowedHost)) ?? allowedHost
+        noWebUI           = (try? c.decode(Bool.self, forKey: .noWebUI)) ?? noWebUI
+        loginItem         = (try? c.decode(Bool.self, forKey: .loginItem)) ?? loginItem
+        autoStartOnLaunch = (try? c.decode(Bool.self, forKey: .autoStartOnLaunch)) ?? autoStartOnLaunch
+        showModelName     = (try? c.decode(Bool.self, forKey: .showModelName)) ?? showModelName
+    }
+
+    static func load() -> Config {
+        if let data = try? Data(contentsOf: configURL),
+           let cfg = try? JSONDecoder().decode(Config.self, from: data) {
+            return cfg
+        }
+        return Config()
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? enc.encode(self) { try? data.write(to: configURL) }
+    }
+
+    var serveArguments: [String] {
+        var a = ["serve", "--model", model, "--max-memory", maxMemory, "--max-context", maxContext]
+        if !allowedHost.isEmpty { a += ["--allowed-host", allowedHost] }
+        if noWebUI { a += ["--no-webui"] }
+        return a
+    }
+}
+
+// MARK: - 工具
+
+@discardableResult
+private func run(_ exe: String, _ args: [String]) -> (status: Int32, out: String, err: String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    let outPipe = Pipe(), errPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError = errPipe
+    do { try p.run() } catch { return (-1, "", error.localizedDescription) }
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus,
+            String(data: outData, encoding: .utf8) ?? "",
+            String(data: errData, encoding: .utf8) ?? "")
+}
+
+private func esc(_ s: String) -> String {
+    s.replacingOccurrences(of: "&", with: "&amp;")
+     .replacingOccurrences(of: "<", with: "&lt;")
+     .replacingOccurrences(of: ">", with: "&gt;")
+}
+
+/// 以新会话（setsid）拉起进程：脱离本 App 的进程组，App 退出后仍存活，
+/// 且 pgid == pid，便于整组（server.py + engine）一次性 kill。
+private func spawnDetached(_ argv: [String], env: [String: String]) -> pid_t? {
+    var pid: pid_t = 0
+
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    posix_spawn_file_actions_addopen(&actions, 1, logOutPath,
+                                     O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    posix_spawn_file_actions_addopen(&actions, 2, logErrPath,
+                                     O_WRONLY | O_CREAT | O_APPEND, 0o644)
+
+    let argvPtr = argv.map { strdup($0) } + [nil]
+    let envPtr  = env.sorted { $0.key < $1.key }.map { strdup("\($0.key)=\($0.value)") } + [nil]
+
+    let rc = posix_spawn(&pid, argv[0], &actions, &attr, argvPtr, envPtr)
+    for p in argvPtr { free(p) }
+    for p in envPtr  { free(p) }
+    posix_spawn_file_actions_destroy(&actions)
+    posix_spawnattr_destroy(&attr)
+    return rc == 0 ? pid : nil
+}
+
+// MARK: - 服务状态
+
+struct Status {
+    var up = false
+    var maxContext = 0
+    var tps = 0.0
+    var accept = 0.0
+    var ttftP50 = 0.0
+    var memoryPressure = ""
+    var residentGB = 0.0
+    var deviceName = ""
+}
+
+// MARK: - 服务控制器
+
+enum Service {
+
+    static var recordedPID: pid_t? {
+        guard let s = try? String(contentsOf: pidURL, encoding: .utf8).trimmingCharacters(in: .newlines),
+              let p = pid_t(s) else { return nil }
+        return p
+    }
+
+    static func isAlive(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0
+    }
+
+    /// 本 App 托管中（pid 文件有效且进程存活）
+    static var managed: Bool {
+        guard let p = recordedPID else { return false }
+        return isAlive(p)
+    }
+
+    /// 是否处于暂停（SIGSTOP 冻结）状态
+    /// 走 libproc 直接读 proc_bsdinfo.pbi_status，不 spawn /bin/ps —— 外部命令在受限
+    /// 执行环境里可能被程序策略拒绝（实测 ps 会 "operation not permitted"），那样会误判成未暂停。
+    static var paused: Bool {
+        guard let p = recordedPID, isAlive(p) else { return false }
+        var info = proc_bsdinfo()
+        let n = proc_pidinfo(p, kProcPidTBSDInfo, 0,
+                             &info, Int32(MemoryLayout<proc_bsdinfo>.stride))
+        if n == Int32(MemoryLayout<proc_bsdinfo>.stride) {
+            return info.pbi_status == kSSTOP
+        }
+        // 极少数情况下 libproc 读不到，退回解析 ps
+        let r = run("/bin/ps", ["-o", "stat=", "-p", "\(p)"])
+        return r.out.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("T")
+    }
+
+    /// 暂停：向整个进程组发 SIGSTOP（进程冻结，显存/内存仍占用，但不再吃 CPU）
+    static func pause() -> String {
+        guard let p = recordedPID, isAlive(p) else { return "没有可暂停的托管进程" }
+        if paused { return "已处于暂停状态" }
+        kill(-p, SIGSTOP)
+        kill(p, SIGSTOP)
+        return "已暂停 pid=\(p)"
+    }
+
+    /// 继续：SIGCONT
+    static func resume() -> String {
+        guard let p = recordedPID, isAlive(p) else { return "没有可恢复的托管进程" }
+        kill(-p, SIGCONT)
+        kill(p, SIGCONT)
+        return "已恢复 pid=\(p)"
+    }
+
+    /// 占用 8000 端口的 pid 列表
+    static func pidsOnPort() -> [pid_t] {
+        let r = run("/usr/sbin/lsof", ["-nP", "-iTCP:\(kPort)", "-sTCP:LISTEN", "-t"])
+        return r.out.split(separator: "\n").compactMap { pid_t($0) }
+    }
+
+    static func start(cfg: Config) -> String {
+        if managed { return "已在运行（pid \(recordedPID!)）" }
+        // 端口已被别人占着时拒绝启动：否则会 spawn 出第二个进程、绑定 8000 失败，
+        // pid 文件却被新 pid 覆盖，造成"显示托管中、实际服务是死的"的错乱状态。
+        if status().up {
+            let who = pidsOnPort().map(String.init).joined(separator: ",")
+            return "拒绝启动：端口 \(kPort) 已被外部进程占用（pid \(who)）。请先停止它，或用 --takeover 接管"
+        }
+        try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: logErrPath).deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: logOutPath, contents: nil)
+        FileManager.default.createFile(atPath: logErrPath, contents: nil)
+
+        var env = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                   "HOME": homeURL().path]
+        if !cfg.apiKey.isEmpty { env["SPLASH_API_KEY"] = cfg.apiKey }
+
+        let argv = [kSplashBin] + cfg.serveArguments
+        guard let pid = spawnDetached(argv, env: env) else {
+            return "启动失败：posix_spawn 返回错误 \(errno)"
+        }
+        try? String(pid).write(to: pidURL, atomically: true, encoding: .utf8)
+        return "已启动 pid=\(pid)"
+    }
+
+    static func stop() -> String {
+        var killed: [pid_t] = []
+        if let pid = recordedPID {
+            kill(-pid, SIGTERM)          // 整组：server.py + serve-native engine
+            kill(pid, SIGTERM)
+            killed.append(pid)
+        }
+        Thread.sleep(forTimeInterval: 2.0)
+        if let pid = recordedPID, isAlive(pid) {
+            kill(-pid, SIGKILL)
+            kill(pid, SIGKILL)
+        }
+        for p in pidsOnPort() where !killed.contains(p) {
+            kill(p, SIGTERM)
+            killed.append(p)
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        for p in pidsOnPort() { kill(p, SIGKILL) }
+        try? FileManager.default.removeItem(at: pidURL)
+        return killed.isEmpty ? "没有需要停止的进程" : "已停止 pid=\(killed.map(String.init).joined(separator: ","))"
+    }
+
+    static func restart(cfg: Config) -> String {
+        _ = stop()
+        return start(cfg: cfg)
+    }
+
+    /// 状态探测。已暂停（进程冻结）时直接短路，避免每次轮询都等 curl 超时。
+    static func status() -> Status {
+        var s = Status()
+        if paused { return s }
+        let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
+                                      kBaseURL + "/status"])
+        guard r.status == 0,
+              let data = r.out.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return s
+        }
+        s.up = true
+        s.maxContext = (obj["maximum_context_tokens"] as? Int) ?? 0
+        s.memoryPressure = (obj["memory_pressure"] as? String) ?? ""
+        if let m = obj["metrics"] as? [String: Any] {
+            if let d = m["decode_tokens_per_second"] as? Double { s.tps = d }
+            if let d = m["draft_acceptance_rate"] as? Double { s.accept = d }
+            if let t = m["ttft_ms"] as? [String: Any], let p = t["p50"] as? Double { s.ttftP50 = p }
+        }
+        if let mp = obj["memory_plan"] as? [String: Any],
+           let dev = mp["device"] as? [String: Any],
+           let n = dev["device_name"] as? String { s.deviceName = n }
+        if let ma = obj["memory_actual"] as? [String: Any],
+           let b = ma["current_bytes"] as? Double { s.residentGB = b / 1_073_741_824.0 }
+        return s
+    }
+}
+
+// MARK: - 菜单状态机（纯函数，可单独验证）
+
+/// 一次探测的快照。四个布尔量决定了整个菜单的可用性。
+struct Snapshot {
+    var served = false    // HTTP /status 有响应
+    var owned = false     // pid 文件有效且进程存活（本 App 托管）
+    var paused = false    // 托管进程处于 SIGSTOP 冻结
+    var starting = false  // 刚刚下发过启动命令的短暂过渡态
+
+    /// 端口在响应，但不是我们管的（例如手工在终端跑的 splash）
+    var isExternal: Bool { served && !owned }
+    /// 真正在提供服务
+    var isRunning: Bool { served && !paused }
+    /// 进程已起、HTTP 还没就绪（Splash 加载模型约 12s）
+    var isLoading: Bool { owned && !served && !paused }
+}
+
+/// 菜单项可用性规则。写成纯函数，便于 `--states` 打印全量真值表核对。
+struct MenuPolicy {
+    let s: Snapshot
+
+    /// 启动（暂停态下语义为"继续"）
+    /// 关键：端口已被占用（served）时一律不可启动，否则会 spawn 第二个进程、
+    /// 绑定 8000 失败，pid 文件却被新 pid 覆盖，造成"显示托管中、实际是死的"错乱。
+    var canStart: Bool { !s.starting && !s.served && (!s.owned || s.paused) }
+
+    /// 暂停：只有真正在跑的托管进程才能暂停
+    var canPause: Bool { s.owned && s.isRunning && !s.starting }
+
+    /// 停止：有托管进程，或端口被外部进程占用（此时"停止"即清掉外部进程）
+    var canStop: Bool { (s.owned || s.isExternal) && !s.starting }
+
+    /// 重启：同停止。外部进程时等价于"接管后重启"
+    var canRestart: Bool { (s.owned || s.isExternal) && !s.starting }
+
+    /// 接管：仅在外部进程占用端口时显示
+    var canTakeOver: Bool { s.isExternal && !s.starting }
+
+    /// 打开 Web UI
+    var canOpenUI: Bool { s.isRunning }
+}
+
+// MARK: - App 委托
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+
+    var statusItem: NSStatusItem!
+    var cfg = Config.load()
+    var st = Status()
+    var timer: Timer?
+    var starting = false
+
+    // MARK: 生命周期
+
+    func applicationDidFinishLaunching(_ aNotification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        rebuildMenu()
+        refresh()
+
+        if cfg.autoStartOnLaunch && !Service.managed && !Service.status().up {
+            starting = true
+            DispatchQueue.global().async { [weak self] in
+                guard let self = self else { return }
+                _ = Service.start(cfg: self.cfg)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    self.starting = false
+                    self.refresh()
+                }
+            }
+            rebuildMenu()
+        }
+
+        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+        RunLoop.main.add(timer!, forMode: .common)
+    }
+
+    func applicationWillTerminate(_ aNotification: Notification) { timer?.invalidate() }
+
+    /// 状态探测放到后台：curl 最长可能阻塞 2 秒，放主线程会让菜单卡顿
+    func refresh() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let s = Service.status()
+            DispatchQueue.main.async {
+                self?.st = s
+                self?.rebuildMenu()
+            }
+        }
+    }
+
+    // MARK: 菜单
+
+    /// 把构建好的菜单挂到状态栏
+    func rebuildMenu() {
+        statusItem.menu = buildMenu()
+        applyStatusButton()
+    }
+
+    /// 纯构建：不碰 statusItem，便于 CLI 里单独 dump 校验
+    func buildMenu() -> NSMenu {
+        let menu = NSMenu()
+        // 必须关掉自动启用！NSMenu.autoenablesItems 默认 true，AppKit 会忽略我们
+        // 手写的 isEnabled，改按"target 是否响应 action"判定；而本类实现了全部
+        // 四个 action，于是启动/暂停/停止/重启会永远点亮（已实测复现）。
+        menu.autoenablesItems = false
+
+        // 一次探测，统一快照；所有可用性判定都走 MenuPolicy
+        let owned = Service.managed
+        let isPaused = Service.paused
+        let snap = Snapshot(served: st.up, owned: owned, paused: isPaused, starting: starting)
+        let policy = MenuPolicy(s: snap)
+
+        let external = snap.isExternal
+        let running = snap.isRunning
+
+        menu.addItem(disabled(headLine()))
+        menu.addItem(disabled("模型    \(cfg.model)"))
+        menu.addItem(disabled("地址    \(kBaseURL + "/v1")"))
+        if running {
+            menu.addItem(disabled(String(format: "速度    %.1f tok/s · 接受率 %.1f%%",
+                                         st.tps, st.accept * 100)))
+            menu.addItem(disabled(String(format: "显存    %.1f GB · %@", st.residentGB, st.memoryPressure)))
+            menu.addItem(disabled(String(format: "首Token %.0f ms · 上限 %dK",
+                                         st.ttftP50, st.maxContext / 1024)))
+        }
+        if let p = Service.recordedPID, Service.isAlive(p) {
+            menu.addItem(disabled(String(format: "进程    pid %d（%@）", p, st.deviceName)))
+        }
+        if external { menu.addItem(disabled("⚠️ 端口被外部进程占用，非 SplashBar 管理")) }
+        if starting { menu.addItem(disabled("⏳ 正在加载模型…")) }
+        menu.addItem(.separator())
+
+        let openUI = NSMenuItem(title: "在浏览器打开 Web UI", action: #selector(openWebUI), keyEquivalent: "o")
+        openUI.target = self
+        openUI.isEnabled = policy.canOpenUI && !cfg.noWebUI
+        menu.addItem(openUI)
+
+        let copyURL = NSMenuItem(title: "复制 API Base URL", action: #selector(copyBaseURL), keyEquivalent: "c")
+        copyURL.target = self
+        menu.addItem(copyURL)
+        menu.addItem(.separator())
+
+        // 启动：运行中 / 端口被占用时置灰；暂停时充当"继续"
+        let startItem = NSMenuItem(title: isPaused ? "▶  继续（恢复运行）" : "▶  启动",
+                                   action: #selector(startService), keyEquivalent: "s")
+        startItem.target = self
+        startItem.isEnabled = policy.canStart
+        menu.addItem(startItem)
+
+        // 暂停：仅"真正在跑的托管进程"可用；暂停中 / 启动中 / 已停止均置灰
+        let pauseItem = NSMenuItem(title: "⏸  暂停", action: #selector(pauseService), keyEquivalent: "p")
+        pauseItem.target = self
+        pauseItem.isEnabled = policy.canPause
+        menu.addItem(pauseItem)
+
+        // 停止：有托管进程或外部进程时可用；已停止置灰
+        let stopItem = NSMenuItem(title: external ? "■  停止（外部进程）" : "■  停止",
+                                  action: #selector(stopService), keyEquivalent: "x")
+        stopItem.target = self
+        stopItem.isEnabled = policy.canStop
+        menu.addItem(stopItem)
+
+        let restartItem = NSMenuItem(title: "⟳  重启", action: #selector(restartService), keyEquivalent: "r")
+        restartItem.target = self
+        restartItem.isEnabled = policy.canRestart
+        menu.addItem(restartItem)
+
+        // 端口被外部进程占用时，给一个显式接管入口（v1.0 有，v1.1 重写菜单时漏掉了，现恢复）
+        if policy.canTakeOver {
+            let take = NSMenuItem(title: "⇪  接管为 SplashBar 管理",
+                                  action: #selector(takeOver), keyEquivalent: "")
+            take.target = self
+            menu.addItem(take)
+        }
+        menu.addItem(.separator())
+
+        menu.addItem(submenuItem("模型", items: modelItems()))
+        menu.addItem(submenuItem("内存上限  --max-memory", items: choiceItems(
+            current: cfg.maxMemory,
+            options: [("auto", "auto（≈107 GB，M5 Max 上限）"),
+                      ("24G", "24G"), ("32G", "32G"), ("48G", "48G"),
+                      ("64G", "64G"), ("96G", "96G")],
+            customLabel: "自定义…（如 28G）", tag: 1)))
+        menu.addItem(submenuItem("上下文  --max-context", items: choiceItems(
+            current: cfg.maxContext,
+            options: [("auto", "auto（262144 = 256K）"),
+                      ("32K", "32K"), ("64K", "64K"), ("128K", "128K"), ("256K", "256K")],
+            customLabel: "自定义…（如 100K）", tag: 2)))
+        menu.addItem(submenuItem("API Key  --api-key", items: apiKeyItems()))
+        menu.addItem(submenuItem("允许 Host  --allowed-host", items: hostItems()))
+        menu.addItem(submenuItem("Web UI  --no-webui", items: webUIItems()))
+        menu.addItem(.separator())
+
+        let showName = NSMenuItem(title: "菜单栏显示模型名", action: #selector(toggleModelName), keyEquivalent: "")
+        showName.target = self
+        showName.state = cfg.showModelName ? .on : .off
+        menu.addItem(showName)
+
+        let login = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
+        login.target = self
+        login.state = cfg.loginItem ? .on : .off
+        menu.addItem(login)
+        menu.addItem(.separator())
+
+        for (title, sel) in [("查看运行日志", #selector(openLogs)),
+                             ("打开模型目录", #selector(openModelDir)),
+                             ("打开配置目录", #selector(openConfigDir))] as [(String, Selector)] {
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            it.target = self
+            menu.addItem(it)
+        }
+        menu.addItem(.separator())
+
+        let about = NSMenuItem(title: "关于 SplashBar", action: #selector(showAbout), keyEquivalent: "")
+        about.target = self
+        menu.addItem(about)
+
+        let quit = NSMenuItem(title: "退出 SplashBar（并停止服务）",
+                              action: #selector(confirmQuit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        return menu
+    }
+
+    private func headLine() -> String {
+        if Service.paused { return "⏸ 已暂停 — 进程已冻结（显存仍占用）" }
+        if st.up {
+            return Service.managed ? "▶ 运行中 — 由 SplashBar 托管" : "▶ 运行中 — 外部进程"
+        }
+        if Service.managed || starting { return "⏳ 启动中 — 已拉起进程，等待模型就绪" }
+        return "■ 已停止"
+    }
+
+    /// 从 App 包 Resources 里按 @3x → @2x → 1x 顺序取菜单栏图标
+    private func menuBarIcon() -> NSImage? {
+        let name: String
+        if Service.paused { name = "menubar_paused" }
+        else if st.up { name = "menubar_running" }
+        else if Service.managed || starting { name = "menubar_paused" }   // 启动中：琥珀色过渡态
+        else { name = "menubar_stopped" }
+
+        let res = Bundle.main.resourcePath ?? ""
+        for suffix in ["@3x", "@2x", ""] {
+            let path = "\(res)/\(name)\(suffix).png"
+            if FileManager.default.fileExists(atPath: path),
+               let img = NSImage(contentsOfFile: path) {
+                img.size = NSSize(width: 18, height: 18)
+                img.isTemplate = false
+                return img
+            }
+        }
+        return nil
+    }
+
+    private func modelShortName() -> String {
+        let short = cfg.model.split(separator: "/").last.map(String.init) ?? cfg.model
+        return short.replacingOccurrences(of: "-Splash", with: "")
+    }
+
+    private func applyStatusButton() {
+        guard let button = statusItem.button else { return }
+        button.image = menuBarIcon()
+        button.imagePosition = cfg.showModelName ? .imageLeading : .imageOnly
+        button.title = cfg.showModelName ? " " + modelShortName() : ""
+        button.toolTip = "SplashBar — \(cfg.model)"
+    }
+
+    private func disabled(_ title: String) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        return it
+    }
+
+    private func submenuItem(_ title: String, items: [NSMenuItem]) -> NSMenuItem {
+        let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false      // 同上：保证子菜单里的自定义置灰生效
+        for i in items { sub.addItem(i) }
+        it.submenu = sub
+        return it
+    }
+
+    private func choiceItems(current: String, options: [(String, String)],
+                             customLabel: String, tag: Int) -> [NSMenuItem] {
+        var items = options.map { value, label -> NSMenuItem in
+            let it = NSMenuItem(title: label, action: #selector(pickValue(_:)), keyEquivalent: "")
+            it.target = self
+            it.tag = tag
+            it.representedObject = value
+            it.state = (value == current) ? .on : .off
+            return it
+        }
+        items.append(.separator())
+        let custom = NSMenuItem(title: customLabel, action: #selector(pickCustom(_:)), keyEquivalent: "")
+        custom.target = self
+        custom.tag = tag
+        items.append(custom)
+        return items
+    }
+
+    private func modelItems() -> [NSMenuItem] {
+        var items = installedModels().map { m -> NSMenuItem in
+            let it = NSMenuItem(title: m, action: #selector(pickModel(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = m
+            it.state = (m == cfg.model) ? .on : .off
+            return it
+        }
+        items.append(.separator())
+        let custom = NSMenuItem(title: "自定义 owner/repo…", action: #selector(pickCustomModel), keyEquivalent: "")
+        custom.target = self
+        items.append(custom)
+        return items
+    }
+
+    private func apiKeyItems() -> [NSMenuItem] {
+        let cur = cfg.apiKey.isEmpty ? "未设置（无鉴权）" : "已设置（\(cfg.apiKey.count) 字符）"
+        let items = [disabled("当前：\(cur)"), NSMenuItem.separator()]
+        let set = NSMenuItem(title: "设置 / 修改…", action: #selector(setAPIKey), keyEquivalent: "")
+        set.target = self
+        let clear = NSMenuItem(title: "清除", action: #selector(clearAPIKey), keyEquivalent: "")
+        clear.target = self
+        clear.isEnabled = !cfg.apiKey.isEmpty
+        return items + [set, clear]
+    }
+
+    private func hostItems() -> [NSMenuItem] {
+        let only = NSMenuItem(title: "仅本机 127.0.0.1", action: #selector(clearHost), keyEquivalent: "")
+        only.target = self
+        only.state = cfg.allowedHost.isEmpty ? .on : .off
+        var items = [only, NSMenuItem.separator()]
+        if !cfg.allowedHost.isEmpty { items.append(disabled("当前：\(cfg.allowedHost)")) }
+        let set = NSMenuItem(title: "允许局域网访问…", action: #selector(setHost), keyEquivalent: "")
+        set.target = self
+        items.append(set)
+        return items
+    }
+
+    private func webUIItems() -> [NSMenuItem] {
+        let on = NSMenuItem(title: "开启（默认）", action: #selector(setWebUIOn), keyEquivalent: "")
+        on.target = self
+        on.state = cfg.noWebUI ? .off : .on
+        let off = NSMenuItem(title: "关闭 --no-webui", action: #selector(setWebUIOff), keyEquivalent: "")
+        off.target = self
+        off.state = cfg.noWebUI ? .on : .off
+        return [on, off]
+    }
+
+    private func installedModels() -> [String] {
+        let fm = FileManager.default
+        var out: [String] = []
+        if let owners = try? fm.contentsOfDirectory(atPath: splashModelsDir.path) {
+            for owner in owners where !owner.hasPrefix(".") {
+                let dir = splashModelsDir.appendingPathComponent(owner)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+                if let names = try? fm.contentsOfDirectory(atPath: dir.path) {
+                    for name in names where !name.hasPrefix(".") { out.append("\(owner)/\(name)") }
+                }
+            }
+        }
+        if out.isEmpty { out = ["incoai/Qwen3.8-27B-Splash", "incoai/Qwen3.6-35B-A3B-Splash"] }
+        if !out.contains(cfg.model) { out.append(cfg.model) }
+        return out.sorted()
+    }
+
+    // MARK: 动作
+
+    @objc func openWebUI() { NSWorkspace.shared.open(URL(string: kBaseURL)!) }
+
+    @objc func copyBaseURL() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(kBaseURL + "/v1", forType: .string)
+    }
+
+    @objc func startService() {
+        // 暂停态下"启动"即"继续"
+        if Service.paused {
+            print("[SplashBar] \(Service.resume())")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.refresh() }
+            return
+        }
+        starting = true
+        rebuildMenu()
+        let cfgNow = cfg
+        DispatchQueue.global().async { [weak self] in
+            let msg = Service.start(cfg: cfgNow)
+            print("[SplashBar] \(msg)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.starting = false
+                self?.refresh()
+            }
+        }
+    }
+
+    @objc func pauseService() {
+        print("[SplashBar] \(Service.pause())")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.refresh() }
+    }
+
+    /// 端口被外部进程占用时：先杀掉它，再由本 App 重新拉起，纳入托管
+    @objc func takeOver() {
+        starting = true
+        rebuildMenu()
+        let cfgNow = cfg
+        DispatchQueue.global().async { [weak self] in
+            let killed = Service.pidsOnPort()
+            for p in killed { kill(p, SIGTERM) }
+            Thread.sleep(forTimeInterval: 1.5)
+            for p in Service.pidsOnPort() { kill(p, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidURL)
+            let msg = Service.start(cfg: cfgNow)
+            print("[SplashBar] 接管：清掉外部进程 [\(killed.map(String.init).joined(separator: ","))]；\(msg)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.starting = false
+                self?.refresh()
+            }
+        }
+    }
+
+    @objc func confirmQuit() {
+        let a = NSAlert()
+        a.messageText = "确定退出 SplashBar？"
+        a.informativeText = """
+        退出将同时停止推理服务：
+        \(cfg.model)
+
+        之后需要重新打开 SplashBar 才能启动服务。
+        """
+        a.alertStyle = .warning
+        a.addButton(withTitle: "退出并停止服务")
+        a.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        print("[SplashBar] 退出：\(Service.stop())")
+        NSApp.terminate(nil)
+    }
+
+    @objc func toggleModelName() {
+        cfg.showModelName.toggle()
+        cfg.save()
+        applyStatusButton()
+    }
+
+    @objc func stopService() {
+        DispatchQueue.global().async { [weak self] in
+            let msg = Service.stop()
+            print("[SplashBar] \(msg)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self?.refresh() }
+        }
+    }
+
+    @objc func restartService() {
+        starting = true
+        rebuildMenu()
+        let cfgNow = cfg
+        DispatchQueue.global().async { [weak self] in
+            let msg = Service.restart(cfg: cfgNow)
+            print("[SplashBar] \(msg)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.starting = false
+                self?.refresh()
+            }
+        }
+    }
+
+    @objc func pickModel(_ sender: NSMenuItem) {
+        guard let m = sender.representedObject as? String else { return }
+        cfg.model = m; cfg.save(); askRestart("模型已切换为 \(m)")
+    }
+
+    @objc func pickCustomModel() {
+        guard let v = askString(title: "自定义模型",
+                                message: "Hugging Face 仓库，格式 owner/repo",
+                                defaultValue: cfg.model), !v.isEmpty else { return }
+        cfg.model = v; cfg.save(); askRestart("模型已切换为 \(v)")
+    }
+
+    @objc func pickValue(_ sender: NSMenuItem) {
+        guard let v = sender.representedObject as? String else { return }
+        if sender.tag == 1 { cfg.maxMemory = v } else { cfg.maxContext = v }
+        cfg.save(); askRestart("参数已更新：\(v)")
+    }
+
+    @objc func pickCustom(_ sender: NSMenuItem) {
+        let isMem = sender.tag == 1
+        guard let v = askString(title: isMem ? "自定义内存上限" : "自定义上下文长度",
+                                message: isMem ? "例如 28G / 512M" : "例如 100K / 32768",
+                                defaultValue: isMem ? cfg.maxMemory : cfg.maxContext),
+              !v.isEmpty else { return }
+        if isMem { cfg.maxMemory = v } else { cfg.maxContext = v }
+        cfg.save(); askRestart("参数已更新：\(v)")
+    }
+
+    @objc func setAPIKey() {
+        guard let v = askString(title: "API Key",
+                                message: "留空表示不鉴权。设置后客户端需带 Authorization: Bearer <key>",
+                                defaultValue: cfg.apiKey) else { return }
+        cfg.apiKey = v; cfg.save(); askRestart("API Key 已更新")
+    }
+
+    @objc func clearAPIKey() { cfg.apiKey = ""; cfg.save(); askRestart("API Key 已清除") }
+
+    @objc func setHost() {
+        guard let v = askString(title: "允许访问的 Host",
+                                message: "填本机局域网 IP（如 192.168.1.20），用于局域网内其他设备访问",
+                                defaultValue: cfg.allowedHost) else { return }
+        cfg.allowedHost = v; cfg.save(); askRestart("已允许 Host：\(v)")
+    }
+
+    @objc func clearHost() { cfg.allowedHost = ""; cfg.save(); askRestart("已恢复为仅本机访问") }
+
+    @objc func setWebUIOn()  { cfg.noWebUI = false; cfg.save(); askRestart("Web UI 已开启") }
+    @objc func setWebUIOff() { cfg.noWebUI = true;  cfg.save(); askRestart("Web UI 已关闭") }
+
+    @objc func toggleLoginItem() {
+        let wanted = !cfg.loginItem
+        do {
+            if wanted {
+                try SMAppService.mainApp.register()
+                cfg.loginItem = true
+                cfg.autoStartOnLaunch = true
+            } else {
+                try SMAppService.mainApp.unregister()
+                cfg.loginItem = false
+                cfg.autoStartOnLaunch = false
+            }
+            cfg.save()
+        } catch {
+            cfg.loginItem = SMAppService.mainApp.status == .enabled
+            cfg.save()
+            let a = NSAlert()
+            a.messageText = "登录项设置失败"
+            a.informativeText = """
+            \(error.localizedDescription)
+
+            可手动添加：系统设置 → 通用 → 登录项与扩展 → 登录时打开 → 添加 SplashBar.app
+            """
+            a.addButton(withTitle: "好")
+            NSApp.activate(ignoringOtherApps: true)
+            a.runModal()
+        }
+        refresh()
+    }
+
+    @objc func openLogs() {
+        try? FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: logErrPath).deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: logErrPath) {
+            FileManager.default.createFile(atPath: logErrPath, contents: nil)
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: logErrPath))
+    }
+
+    @objc func openModelDir()  { NSWorkspace.shared.open(splashModelsDir) }
+    @objc func openConfigDir() { NSWorkspace.shared.open(appSupportDir) }
+
+    @objc func showAbout() {
+        let alert = NSAlert()
+        alert.messageText = "SplashBar 1.0"
+        alert.informativeText = """
+        Splash 本地推理服务菜单栏控制器
+
+        服务：\(cfg.model)
+        参数：\(cfg.serveArguments.joined(separator: " "))
+        进程：\(Service.recordedPID.map(String.init) ?? "无")
+        配置：\(configURL.path)
+        日志：\(logErrPath)
+        登录项：\(SMAppService.mainApp.status == .enabled ? "已注册" : "未注册")
+        """
+        alert.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    // MARK: 菜单校验（第二道保险）
+
+    /// 兜底：万一某处把 autoenablesItems 又开回来，AppKit 会改调这个方法来决定可用性。
+    /// 判定与 rebuildMenu() 里的 isEnabled 走同一套 MenuPolicy，保证两边永不打架。
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let snap = Snapshot(served: st.up, owned: Service.managed,
+                            paused: Service.paused, starting: starting)
+        let p = MenuPolicy(s: snap)
+        let a = menuItem.action
+
+        if a == #selector(startService)   { return p.canStart }
+        if a == #selector(pauseService)   { return p.canPause }
+        if a == #selector(stopService)    { return p.canStop }
+        if a == #selector(restartService) { return p.canRestart }
+        if a == #selector(takeOver)       { return p.canTakeOver }
+        if a == #selector(openWebUI)      { return p.canOpenUI && !cfg.noWebUI }
+        if a == #selector(clearAPIKey)    { return !cfg.apiKey.isEmpty }
+        return true
+    }
+
+    // MARK: 辅助
+
+    private func askRestart(_ what: String) {
+        guard Service.managed || st.up else { refresh(); return }
+        let alert = NSAlert()
+        alert.messageText = what
+        alert.informativeText = "需要重启服务才能生效。是否立即重启？"
+        alert.addButton(withTitle: "立即重启")
+        alert.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { restartService() } else { refresh() }
+    }
+
+    private func askString(title: String, message: String, defaultValue: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        tf.stringValue = defaultValue
+        alert.accessoryView = tf
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = tf
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+            ? tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+    }
+}
+
+// MARK: - CLI
+
+private func yn(_ b: Bool) -> String { b ? "✅" : "──" }
+
+func runCLI(_ argv: [String]) -> Bool {
+    guard argv.count >= 2 else { return false }
+    let cmd = argv[1]
+    switch cmd {
+    case "--start", "--stop", "--restart", "--status", "--states", "--takeover",
+         "--pause", "--resume", "--login-on", "--login-off", "--dump-menu":
+        break
+    case "--help", "-h":
+        print("""
+        SplashBar CLI
+
+          SplashBar --status     查看服务状态与当前参数
+          SplashBar --start      启动（新会话子进程，App 退出后仍存活）
+          SplashBar --pause      暂停（SIGSTOP 冻结进程组，显存仍占用）
+          SplashBar --resume     继续（SIGCONT）
+          SplashBar --stop       停止（整组 kill）
+          SplashBar --restart    重启
+          SplashBar --login-on   注册为登录项（登录时拉起 SplashBar 并自动启动服务）
+          SplashBar --login-off  取消登录项
+          SplashBar --takeover   杀掉占用 8000 的外部进程并纳入托管
+          SplashBar --states     打印菜单状态机真值表（含当前实测状态）
+          SplashBar --dump-menu  构建真实菜单并打印每项的最终可用性（含 AppKit 校验后的结果）
+        """)
+        return true
+    default:
+        return false
+    }
+
+    let cfg = Config.load()
+    switch cmd {
+    case "--status":
+        let s = Service.status()
+        print("配置:      \(configURL.path)")
+        print("模型:      \(cfg.model)")
+        print("参数:      \(cfg.serveArguments.joined(separator: " "))")
+        let state = Service.paused ? "已暂停"
+                  : (s.up ? (Service.managed ? "运行中（托管）" : "运行中（外部）") : "已停止")
+        print("状态:      \(state)")
+        print("托管进程:  \(Service.managed ? "pid \(Service.recordedPID!)" : "无")")
+        print("HTTP:      \(s.up ? "ok" : "无响应")")
+        if s.up {
+            print(String(format: "速度:      %.1f tok/s · 接受率 %.1f%% · 显存 %.1f GB",
+                         s.tps, s.accept * 100, s.residentGB))
+        }
+        print("登录项:    \(SMAppService.mainApp.status == .enabled ? "已注册" : "未注册")")
+    case "--start":
+        print(Service.start(cfg: cfg))
+        Thread.sleep(forTimeInterval: 3)
+        print("HTTP: \(Service.status().up ? "ok" : "无响应")")
+    case "--stop":
+        print(Service.stop())
+    case "--restart":
+        print(Service.restart(cfg: cfg))
+    case "--states":
+        // 全量真值表：所有可达状态的菜单可用性
+        let rows: [(String, Snapshot)] = [
+            ("已停止        ", Snapshot(served: false, owned: false, paused: false, starting: false)),
+            ("运行中(托管)  ", Snapshot(served: true,  owned: true,  paused: false, starting: false)),
+            ("暂停中(托管)  ", Snapshot(served: false, owned: true,  paused: true,  starting: false)),
+            ("启动中(加载)  ", Snapshot(served: false, owned: true,  paused: false, starting: false)),
+            ("外部进程占用  ", Snapshot(served: true,  owned: false, paused: false, starting: false)),
+        ]
+        print("状态              启动  暂停  停止  重启  接管  WebUI")
+        print("─────────────────────────────────────────────────")
+        for (name, snap) in rows {
+            let p = MenuPolicy(s: snap)
+            print("\(name)  \(yn(p.canStart))    \(yn(p.canPause))    \(yn(p.canStop))    \(yn(p.canRestart))    \(yn(p.canTakeOver))    \(yn(p.canOpenUI))")
+        }
+        print("─────────────────────────────────────────────────")
+        let s = Service.status()
+        let live = Snapshot(served: s.up, owned: Service.managed,
+                            paused: Service.paused, starting: false)
+        let lp = MenuPolicy(s: live)
+        let label = live.paused ? "暂停中(托管)" : live.isLoading ? "启动中(加载)"
+                  : live.isExternal ? "外部进程占用" : live.served ? "运行中(托管)" : "已停止"
+        print("当前实测: \(label)")
+        print("           启动 \(yn(lp.canStart))  暂停 \(yn(lp.canPause))  停止 \(yn(lp.canStop))  重启 \(yn(lp.canRestart))  接管 \(yn(lp.canTakeOver))")
+    case "--dump-menu":
+        // 走与 App 完全相同的构建路径，再让 AppKit 跑一遍它的启用校验，
+        // 打印校验之后的真实结果 —— 这是唯一能证明"置灰真的生效"的方法。
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let d = AppDelegate()
+        d.cfg = Config.load()
+        d.st = Service.status()
+        let menu = d.buildMenu()
+
+        func dump(_ mode: String) {
+            menu.autoenablesItems = (mode == "auto=true")
+            menu.update()   // 触发 AppKit 的自动启用校验
+            print("")
+            print("── 校验模式：\(mode) ──")
+            for it in menu.items where !it.isSeparatorItem {
+                if it.title.hasPrefix("  ") || it.title.hasPrefix("模型  ")
+                    || it.title.hasPrefix("地址") || it.title.hasPrefix("进程")
+                    || it.title.hasPrefix("速度") || it.title.hasPrefix("显存")
+                    || it.title.hasPrefix("首Token") { continue }
+                let mark = it.isEnabled ? "✅ 可用" : "── 置灰"
+                let arrow = it.submenu != nil ? "  ▸" : ""
+                print("  \(mark)   \(it.title)\(arrow)")
+            }
+        }
+        dump("auto=false")
+        dump("auto=true")
+    case "--takeover":
+        let killed = Service.pidsOnPort()
+        for p in killed { kill(p, SIGTERM) }
+        Thread.sleep(forTimeInterval: 1.5)
+        for p in Service.pidsOnPort() { kill(p, SIGKILL) }
+        try? FileManager.default.removeItem(at: pidURL)
+        print("已清掉外部进程 [\(killed.map(String.init).joined(separator: ","))]")
+        print(Service.start(cfg: cfg))
+        Thread.sleep(forTimeInterval: 3)
+        print("HTTP: \(Service.status().up ? "ok" : "无响应")")
+    case "--pause":
+        print(Service.pause())
+    case "--resume":
+        print(Service.resume())
+    case "--login-on":
+        do {
+            try SMAppService.mainApp.register()
+            cfg.loginItem = true; cfg.autoStartOnLaunch = true; cfg.save()
+            print("登录项: 已注册（status=\(SMAppService.mainApp.status == .enabled ? "enabled" : "notEnabled")）")
+        } catch { print("注册失败: \(error.localizedDescription)") }
+    case "--login-off":
+        do {
+            try SMAppService.mainApp.unregister()
+            cfg.loginItem = false; cfg.autoStartOnLaunch = false; cfg.save()
+            print("登录项: 已取消")
+        } catch { print("取消失败: \(error.localizedDescription)") }
+    default: break
+    }
+    return true
+}
+
+// MARK: - main
+
+if runCLI(CommandLine.arguments) { exit(0) }
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()

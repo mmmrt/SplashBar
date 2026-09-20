@@ -21,6 +21,8 @@ func syncPort(_ p: String) { activePort = p.isEmpty ? "8000" : p }
 
 // libproc 常量（直接给字面量，避免依赖 C 宏是否被 Swift 桥接）
 private let kProcPidTBSDInfo: Int32 = 3   // PROC_PIDTBSDINFO（实测返回 136 = sizeof(proc_bsdinfo)）
+// 纯信息行（不可点）的标记，--dump-menu 靠它区分"信息行"和"置灰的功能项"
+private let kInfoTag = 99
 // sys/proc.h: SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
 // 注意 SSTOP 是 4，写成 3(SSLEEP) 会导致暂停永远检测不到
 private let kSSTOP: UInt32 = 4
@@ -167,6 +169,11 @@ struct Status {
 
 enum Service {
 
+    /// 版本探测的两个小缓存：运行中版本按 pid 缓存，已安装版本只查一次
+    private static var versionCache: (pid: pid_t, version: String?)?
+    private static var installedCache: String?
+    private static var installedQueried = false
+
     static var recordedPID: pid_t? {
         guard let s = try? String(contentsOf: pidURL, encoding: .utf8).trimmingCharacters(in: .newlines),
               let p = pid_t(s) else { return nil }
@@ -220,6 +227,57 @@ enum Service {
     static func pidsOnPort() -> [pid_t] {
         let r = run("/usr/sbin/lsof", ["-nP", "-iTCP:\(activePort)", "-sTCP:LISTEN", "-t"])
         return r.out.split(separator: "\n").compactMap { pid_t($0) }
+    }
+
+    // MARK: 版本探测
+
+    /// 「正在运行」的版本。`/status` 不提供版本字段（schema 5 里只有 schema_version），
+    /// 所以从进程可执行文件路径反推：托管进程跑的是
+    /// `…/Cellar/splash/<ver>/libexec/python/bin/python3.13`（brew 装）
+    /// 或 `…/splash-<ver>-arm64-macos26/…`（release 包解包后手动跑）。
+    static func runningVersion() -> String? {
+        guard let pid = recordedPID, isAlive(pid) else { return nil }
+        if let cached = versionCache, cached.pid == pid { return cached.version }
+        let r = run("/usr/sbin/lsof", ["-p", String(pid), "-a", "-d", "txt", "-Fn"])
+        var found: String?
+        for line in r.out.split(separator: "\n") where line.hasPrefix("n") {
+            if let v = versionFromPath(String(line.dropFirst())) { found = v; break }
+        }
+        versionCache = (pid, found)
+        return found
+    }
+
+    /// 从可执行文件路径里抽版本号。
+    /// 逐个候选扫描而不是只取第一处匹配 —— 因为解包目录常被放在名字里也带 "splash-" 的
+    /// 父目录下（如 /tmp/splash-test/v10/splash-1.0-arm64-macos26/…），只取第一处会解析失败。
+    static func versionFromPath(_ path: String) -> String? {
+        var idx = path.startIndex
+        while let r = path.range(of: "/Cellar/splash/", range: idx..<path.endIndex) {
+            let v = path[r.upperBound...].prefix { $0 != "/" }
+            if v.first?.isNumber == true { return String(v) }
+            idx = r.upperBound
+        }
+        idx = path.startIndex
+        while let r = path.range(of: "/splash-", range: idx..<path.endIndex) {
+            let v = path[r.upperBound...].prefix { $0.isNumber || $0 == "." }
+            if v.contains(where: \.isNumber) { return String(v) }
+            idx = r.upperBound
+        }
+        return nil
+    }
+
+    /// 「已安装」的版本（`splash --version` → "Splash 1.0.1"）。
+    /// 会拉起一个 Python，耗时约 0.3–1s，所以只查一次然后缓存。
+    static func installedVersion() -> String? {
+        if installedQueried { return installedCache }
+        installedQueried = true
+        let r = run(kSplashBin, ["--version"])
+        let raw = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.status == 0, let last = raw.split(separator: " ").last,
+           last.contains(where: \.isNumber) {
+            installedCache = String(last)
+        }
+        return installedCache
     }
 
     static func start(cfg: Config) -> String {
@@ -424,31 +482,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let external = snap.isExternal
         let running = snap.isRunning
 
-        menu.addItem(disabled(headLine()))
-        menu.addItem(disabled("模型    \(cfg.model)"))
-        menu.addItem(disabled("地址    \(baseURL + "/v1")"))
+        // ── 状态区：压到 4 行以内（原来是 7 行）
+        let runVer = Service.runningVersion()
+        let instVer = Service.installedVersion()
+        menu.addItem(disabled("Splash \(runVer ?? instVer ?? "?")  ·  \(stateLabel())"))
         if running {
-            menu.addItem(disabled(String(format: "速度    %.1f tok/s · 接受率 %.1f%%",
-                                         st.tps, st.accept * 100)))
-            menu.addItem(disabled(String(format: "显存    %.1f GB · %@", st.residentGB, st.memoryPressure)))
-            menu.addItem(disabled(String(format: "首Token %.0f ms · 上限 %dK",
-                                         st.ttftP50, st.maxContext / 1024)))
+            menu.addItem(disabled(String(format: "%.1f tok/s · 接受率 %.1f%% · 显存 %.1f GB",
+                                         st.tps, st.accept * 100, st.residentGB)))
         }
-        if let p = Service.recordedPID, Service.isAlive(p) {
-            menu.addItem(disabled(String(format: "进程    pid %d（%@）", p, st.deviceName)))
+        menu.addItem(disabled("\(modelShortName())  ·  \(baseURL.replacingOccurrences(of: "http://", with: ""))"))
+        if running {
+            menu.addItem(disabled(String(format: "首Token %.0f ms · 上限 %dK", st.ttftP50, st.maxContext / 1024)))
+        }
+        if let r = runVer, let i = instVer, r != i {
+            menu.addItem(disabled("⚠️ 运行中 \(r) ≠ 已安装 \(i)，重启后可切换"))
         }
         if external { menu.addItem(disabled("⚠️ 端口被外部进程占用，非 SplashBar 管理")) }
         if starting { menu.addItem(disabled("⏳ 正在加载模型…")) }
-        menu.addItem(.separator())
-
-        let openUI = NSMenuItem(title: "在浏览器打开 Web UI", action: #selector(openWebUI), keyEquivalent: "o")
-        openUI.target = self
-        openUI.isEnabled = policy.canOpenUI && !cfg.noWebUI
-        menu.addItem(openUI)
-
-        let copyURL = NSMenuItem(title: "复制 API Base URL", action: #selector(copyBaseURL), keyEquivalent: "c")
-        copyURL.target = self
-        menu.addItem(copyURL)
         menu.addItem(.separator())
 
         // 启动：运行中 / 端口被占用时置灰；暂停时充当"继续"
@@ -485,56 +535,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         menu.addItem(.separator())
 
-        menu.addItem(submenuItem("模型", items: modelItems()))
-        menu.addItem(submenuItem("内存上限  --max-memory", items: choiceItems(
-            current: cfg.maxMemory,
-            options: [("auto", "auto（≈107 GB，M5 Max 上限）"),
-                      ("24G", "24G"), ("32G", "32G"), ("48G", "48G"),
-                      ("64G", "64G"), ("96G", "96G")],
-            customLabel: "自定义…（如 28G）", tag: 1)))
-        menu.addItem(submenuItem("上下文  --max-context", items: choiceItems(
-            current: cfg.maxContext,
-            options: [("auto", "auto（262144 = 256K）"),
-                      ("32K", "32K"), ("64K", "64K"), ("128K", "128K"), ("256K", "256K")],
-            customLabel: "自定义…（如 100K）", tag: 2)))
-        menu.addItem(submenuItem("端口  --port", items: choiceItems(
-            current: cfg.port,
-            options: [("8000", "8000（Splash 默认）"),
-                      ("8080", "8080"), ("8123", "8123"), ("9000", "9000")],
-            customLabel: "自定义…（如 7000）", tag: 3)))
-        menu.addItem(submenuItem("请求体上限  --max-request-size", items: choiceItems(
-            current: cfg.maxRequestSize,
-            options: [("", "128M（Splash 1.0.1 默认，不传该参数）"),
-                      ("64M", "64M"), ("256M", "256M"), ("512M", "512M"), ("1G", "1G")],
-            customLabel: "自定义…（如 32M）", tag: 4)))
-        menu.addItem(submenuItem("API Key  --api-key", items: apiKeyItems()))
-        menu.addItem(submenuItem("允许 Host  --allowed-host", items: hostItems()))
-        menu.addItem(submenuItem("Web UI  --no-webui", items: webUIItems()))
-        menu.addItem(.separator())
+        // ── 参数设置：8 个参数子菜单收进一个入口（原来平铺占 8 行）
+        menu.addItem(submenuItem("参数设置", items: [
+            submenuItem("模型", items: modelItems()),
+            submenuItem("内存上限  --max-memory", items: choiceItems(
+                current: cfg.maxMemory,
+                options: [("auto", "auto（≈107 GB，M5 Max 上限）"),
+                          ("24G", "24G"), ("32G", "32G"), ("48G", "48G"),
+                          ("64G", "64G"), ("96G", "96G")],
+                customLabel: "自定义…（如 28G）", tag: 1)),
+            submenuItem("上下文  --max-context", items: choiceItems(
+                current: cfg.maxContext,
+                options: [("auto", "auto（262144 = 256K）"),
+                          ("32K", "32K"), ("64K", "64K"), ("128K", "128K"), ("256K", "256K")],
+                customLabel: "自定义…（如 100K）", tag: 2)),
+            submenuItem("端口  --port", items: choiceItems(
+                current: cfg.port,
+                options: [("8000", "8000（Splash 默认）"),
+                          ("8080", "8080"), ("8123", "8123"), ("9000", "9000")],
+                customLabel: "自定义…（如 7000）", tag: 3)),
+            submenuItem("请求体上限  --max-request-size", items: choiceItems(
+                current: cfg.maxRequestSize,
+                options: [("", "128M（Splash 1.0.1 默认，不传该参数）"),
+                          ("64M", "64M"), ("256M", "256M"), ("512M", "512M"), ("1G", "1G")],
+                customLabel: "自定义…（如 32M）", tag: 4)),
+            submenuItem("API Key  --api-key", items: apiKeyItems()),
+            submenuItem("允许 Host  --allowed-host", items: hostItems()),
+            submenuItem("Web UI  --no-webui", items: webUIItems()),
+        ]))
 
-        let showName = NSMenuItem(title: "菜单栏显示模型名", action: #selector(toggleModelName), keyEquivalent: "")
-        showName.target = self
-        showName.state = cfg.showModelName ? .on : .off
-        menu.addItem(showName)
-
-        let login = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
-        login.target = self
-        login.state = cfg.loginItem ? .on : .off
-        menu.addItem(login)
-        menu.addItem(.separator())
-
+        // ── 打开：5 个入口收进一个子菜单（原来平铺占 5 行）
+        let openUI = NSMenuItem(title: "在浏览器打开 Web UI", action: #selector(openWebUI), keyEquivalent: "o")
+        openUI.target = self
+        openUI.isEnabled = policy.canOpenUI && !cfg.noWebUI
+        let copyURL = NSMenuItem(title: "复制 API Base URL", action: #selector(copyBaseURL), keyEquivalent: "c")
+        copyURL.target = self
+        var openItems: [NSMenuItem] = [openUI, copyURL, .separator()]
         for (title, sel) in [("查看运行日志", #selector(openLogs)),
                              ("打开模型目录", #selector(openModelDir)),
                              ("打开配置目录", #selector(openConfigDir))] as [(String, Selector)] {
             let it = NSMenuItem(title: title, action: sel, keyEquivalent: "")
             it.target = self
-            menu.addItem(it)
+            openItems.append(it)
         }
-        menu.addItem(.separator())
+        menu.addItem(submenuItem("打开", items: openItems))
+
+        // ── 偏好与关于：开关 + 关于收进一个子菜单（原来平铺占 3 行）
+        let showName = NSMenuItem(title: "菜单栏显示模型名", action: #selector(toggleModelName), keyEquivalent: "")
+        showName.target = self
+        showName.state = cfg.showModelName ? .on : .off
+
+        let login = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
+        login.target = self
+        login.state = cfg.loginItem ? .on : .off
 
         let about = NSMenuItem(title: "关于 SplashBar", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
-        menu.addItem(about)
+        menu.addItem(submenuItem("偏好与关于", items: [showName, login, .separator(), about]))
+        menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "退出 SplashBar（并停止服务）",
                               action: #selector(confirmQuit), keyEquivalent: "q")
@@ -544,13 +602,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return menu
     }
 
-    private func headLine() -> String {
-        if Service.paused { return "⏸ 已暂停 — 进程已冻结（显存仍占用）" }
-        if st.up {
-            return Service.managed ? "▶ 运行中 — 由 SplashBar 托管" : "▶ 运行中 — 外部进程"
-        }
-        if Service.managed || starting { return "⏳ 启动中 — 已拉起进程，等待模型就绪" }
-        return "■ 已停止"
+    /// 状态短标签（和版本号拼在同一行，所以不重复图标之外的信息）
+    private func stateLabel() -> String {
+        if Service.paused { return "已暂停（进程冻结，显存仍占用）" }
+        if st.up { return Service.managed ? "运行中（托管）" : "运行中（外部进程）" }
+        if Service.managed || starting { return "启动中（等待模型就绪）" }
+        return "已停止"
     }
 
     /// 从 App 包 Resources 里按 @3x → @2x → 1x 顺序取菜单栏图标
@@ -590,6 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func disabled(_ title: String) -> NSMenuItem {
         let it = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         it.isEnabled = false
+        it.tag = kInfoTag          // 打标，方便 --dump-menu 跳过纯信息行
         return it
     }
 
@@ -913,11 +971,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func openConfigDir() { NSWorkspace.shared.open(appSupportDir) }
 
     @objc func showAbout() {
+        // 版本号只认 Info.plist，避免两处各写一份对不上
+        let appVer = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         let alert = NSAlert()
-        alert.messageText = "SplashBar 1.0"
+        alert.messageText = "SplashBar \(appVer)"
         alert.informativeText = """
         Splash 本地推理服务菜单栏控制器
 
+        引擎版本：运行中 \(Service.runningVersion() ?? "—") · 已安装 \(Service.installedVersion() ?? "—")
         服务：\(cfg.model)
         参数：\(cfg.serveArguments.joined(separator: " "))
         进程：\(Service.recordedPID.map(String.init) ?? "无")
@@ -997,7 +1058,7 @@ func runCLI(_ argv: [String]) -> Bool {
     let cmd = argv[1]
     switch cmd {
     case "--start", "--stop", "--restart", "--status", "--states", "--takeover",
-         "--pause", "--resume", "--login-on", "--login-off", "--dump-menu":
+         "--pause", "--resume", "--login-on", "--login-off", "--dump-menu", "--version-of":
         break
     case "--help", "-h":
         print("""
@@ -1013,7 +1074,8 @@ func runCLI(_ argv: [String]) -> Bool {
           SplashBar --login-off  取消登录项
           SplashBar --takeover   杀掉占用当前端口的外部进程并纳入托管
           SplashBar --states     打印菜单状态机真值表（含当前实测状态）
-          SplashBar --dump-menu  构建真实菜单并打印每项的最终可用性（含 AppKit 校验后的结果）
+          SplashBar --dump-menu  构建真实菜单并递归打印每项可用性（含 AppKit 校验后的结果）
+          SplashBar --version-of <path>  用版本解析逻辑解析一条可执行文件路径（调试用）
         """)
         return true
     default:
@@ -1026,6 +1088,7 @@ func runCLI(_ argv: [String]) -> Bool {
     case "--status":
         let s = Service.status()
         print("配置:      \(configURL.path)")
+        print("引擎版本:  运行中 \(Service.runningVersion() ?? "—") · 已安装 \(Service.installedVersion() ?? "—")")
         print("模型:      \(cfg.model)")
         print("参数:      \(cfg.serveArguments.joined(separator: " "))")
         let state = Service.paused ? "已暂停"
@@ -1080,20 +1143,27 @@ func runCLI(_ argv: [String]) -> Bool {
         d.st = Service.status()
         let menu = d.buildMenu()
 
-        func dump(_ mode: String) {
-            menu.autoenablesItems = (mode == "auto=true")
-            menu.update()   // 触发 AppKit 的自动启用校验
-            print("")
-            print("── 校验模式：\(mode) ──")
-            for it in menu.items where !it.isSeparatorItem {
-                if it.title.hasPrefix("  ") || it.title.hasPrefix("模型  ")
-                    || it.title.hasPrefix("地址") || it.title.hasPrefix("进程")
-                    || it.title.hasPrefix("速度") || it.title.hasPrefix("显存")
-                    || it.title.hasPrefix("首Token") { continue }
+        // 递归打印（子菜单也走 AppKit 的校验）；信息行单独标注，便于核对顶部布局
+        func walk(_ m: NSMenu, _ indent: String, _ auto: Bool) {
+            m.autoenablesItems = auto
+            m.update()
+            for it in m.items {
+                if it.isSeparatorItem { continue }
+                if it.tag == kInfoTag {
+                    print("\(indent)· 信息   \(it.title)")
+                    continue
+                }
                 let mark = it.isEnabled ? "✅ 可用" : "── 置灰"
                 let arrow = it.submenu != nil ? "  ▸" : ""
-                print("  \(mark)   \(it.title)\(arrow)")
+                print("\(indent)\(mark)   \(it.title)\(arrow)")
+                if let sub = it.submenu { walk(sub, indent + "    ", auto) }
             }
+        }
+
+        func dump(_ mode: String) {
+            print("")
+            print("── 校验模式：\(mode) ──")
+            walk(menu, "  ", mode == "auto=true")
         }
         dump("auto=false")
         dump("auto=true")
@@ -1109,6 +1179,10 @@ func runCLI(_ argv: [String]) -> Bool {
         print("HTTP: \(Service.status().up ? "ok" : "无响应")")
     case "--pause":
         print(Service.pause())
+    case "--version-of":
+        // 调试验证用：把一条可执行文件路径喂给版本解析逻辑
+        guard argv.count >= 3 else { print("用法: --version-of <path>"); return true }
+        print(Service.versionFromPath(argv[2]) ?? "（无法识别）")
     case "--resume":
         print(Service.resume())
     case "--login-on":

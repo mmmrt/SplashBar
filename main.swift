@@ -10,8 +10,14 @@ import ServiceManagement
 // MARK: - 常量与路径
 
 private let kSplashBin = "/opt/homebrew/bin/splash"
-private let kBaseURL   = "http://127.0.0.1:8000"
-private let kPort      = "8000"
+
+// Splash 1.0.1 起支持 `--port`，可以有多个实例跑在不同端口上，
+// 所以端口不能再是编译期常量。App 启动和 CLI 入口统一先 syncPort(cfg.port)，
+// 让下面这些静态方法（lsof / curl / 拼 URL）探到正确的端口。
+var activePort: String = "8000"
+private var baseURL: String { "http://127.0.0.1:\(activePort)" }
+
+func syncPort(_ p: String) { activePort = p.isEmpty ? "8000" : p }
 
 // libproc 常量（直接给字面量，避免依赖 C 宏是否被 Swift 桥接）
 private let kProcPidTBSDInfo: Int32 = 3   // PROC_PIDTBSDINFO（实测返回 136 = sizeof(proc_bsdinfo)）
@@ -38,6 +44,10 @@ final class Config: Codable {
     var maxContext: String = "auto"
     var apiKey: String = ""
     var allowedHost: String = ""
+    /// HTTP 端口。Splash 1.0.1 起支持 --port，改这里就能跑多个实例
+    var port: String = "8000"
+    /// --max-request-size。留空=不传该参数，用 Splash 默认（1.0.1 起为 128M）
+    var maxRequestSize: String = ""
     var noWebUI: Bool = false
     var loginItem: Bool = false
     var autoStartOnLaunch: Bool = false
@@ -54,6 +64,8 @@ final class Config: Codable {
         maxContext        = (try? c.decode(String.self, forKey: .maxContext)) ?? maxContext
         apiKey            = (try? c.decode(String.self, forKey: .apiKey)) ?? apiKey
         allowedHost       = (try? c.decode(String.self, forKey: .allowedHost)) ?? allowedHost
+        port              = (try? c.decode(String.self, forKey: .port)) ?? port
+        maxRequestSize    = (try? c.decode(String.self, forKey: .maxRequestSize)) ?? maxRequestSize
         noWebUI           = (try? c.decode(Bool.self, forKey: .noWebUI)) ?? noWebUI
         loginItem         = (try? c.decode(Bool.self, forKey: .loginItem)) ?? loginItem
         autoStartOnLaunch = (try? c.decode(Bool.self, forKey: .autoStartOnLaunch)) ?? autoStartOnLaunch
@@ -77,6 +89,9 @@ final class Config: Codable {
 
     var serveArguments: [String] {
         var a = ["serve", "--model", model, "--max-memory", maxMemory, "--max-context", maxContext]
+        // 端口只在非默认时才显式传 --port，这样旧的 Splash（1.0，无此参数）也能照常跑
+        if !port.isEmpty && port != "8000" { a += ["--port", port] }
+        if !maxRequestSize.isEmpty { a += ["--max-request-size", maxRequestSize] }
         if !allowedHost.isEmpty { a += ["--allowed-host", allowedHost] }
         if noWebUI { a += ["--no-webui"] }
         return a
@@ -201,9 +216,9 @@ enum Service {
         return "已恢复 pid=\(p)"
     }
 
-    /// 占用 8000 端口的 pid 列表
+    /// 占用当前配置端口的 pid 列表
     static func pidsOnPort() -> [pid_t] {
-        let r = run("/usr/sbin/lsof", ["-nP", "-iTCP:\(kPort)", "-sTCP:LISTEN", "-t"])
+        let r = run("/usr/sbin/lsof", ["-nP", "-iTCP:\(activePort)", "-sTCP:LISTEN", "-t"])
         return r.out.split(separator: "\n").compactMap { pid_t($0) }
     }
 
@@ -213,7 +228,7 @@ enum Service {
         // pid 文件却被新 pid 覆盖，造成"显示托管中、实际服务是死的"的错乱状态。
         if status().up {
             let who = pidsOnPort().map(String.init).joined(separator: ",")
-            return "拒绝启动：端口 \(kPort) 已被外部进程占用（pid \(who)）。请先停止它，或用 --takeover 接管"
+            return "拒绝启动：端口 \(activePort) 已被外部进程占用（pid \(who)）。请先停止它，或用 --takeover 接管"
         }
         try? FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(
@@ -266,7 +281,7 @@ enum Service {
         var s = Status()
         if paused { return s }
         let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
-                                      kBaseURL + "/status"])
+                                      baseURL + "/status"])
         guard r.status == 0,
               let data = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -345,6 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        syncPort(cfg.port)          // 必须在任何 Service 探测之前，否则会探到默认端口
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -410,7 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         menu.addItem(disabled(headLine()))
         menu.addItem(disabled("模型    \(cfg.model)"))
-        menu.addItem(disabled("地址    \(kBaseURL + "/v1")"))
+        menu.addItem(disabled("地址    \(baseURL + "/v1")"))
         if running {
             menu.addItem(disabled(String(format: "速度    %.1f tok/s · 接受率 %.1f%%",
                                          st.tps, st.accept * 100)))
@@ -481,6 +497,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             options: [("auto", "auto（262144 = 256K）"),
                       ("32K", "32K"), ("64K", "64K"), ("128K", "128K"), ("256K", "256K")],
             customLabel: "自定义…（如 100K）", tag: 2)))
+        menu.addItem(submenuItem("端口  --port", items: choiceItems(
+            current: cfg.port,
+            options: [("8000", "8000（Splash 默认）"),
+                      ("8080", "8080"), ("8123", "8123"), ("9000", "9000")],
+            customLabel: "自定义…（如 7000）", tag: 3)))
+        menu.addItem(submenuItem("请求体上限  --max-request-size", items: choiceItems(
+            current: cfg.maxRequestSize,
+            options: [("", "128M（Splash 1.0.1 默认，不传该参数）"),
+                      ("64M", "64M"), ("256M", "256M"), ("512M", "512M"), ("1G", "1G")],
+            customLabel: "自定义…（如 32M）", tag: 4)))
         menu.addItem(submenuItem("API Key  --api-key", items: apiKeyItems()))
         menu.addItem(submenuItem("允许 Host  --allowed-host", items: hostItems()))
         menu.addItem(submenuItem("Web UI  --no-webui", items: webUIItems()))
@@ -662,12 +688,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     // MARK: 动作
 
-    @objc func openWebUI() { NSWorkspace.shared.open(URL(string: kBaseURL)!) }
+    @objc func openWebUI() { NSWorkspace.shared.open(URL(string: baseURL)!) }
 
     @objc func copyBaseURL() {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(kBaseURL + "/v1", forType: .string)
+        pb.setString(baseURL + "/v1", forType: .string)
     }
 
     @objc func startService() {
@@ -775,18 +801,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func pickValue(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? String else { return }
-        if sender.tag == 1 { cfg.maxMemory = v } else { cfg.maxContext = v }
-        cfg.save(); askRestart("参数已更新：\(v)")
+        switch sender.tag {
+        case 1:  cfg.maxMemory = v
+        case 2:  cfg.maxContext = v
+        case 3:  cfg.port = v
+        case 4:  cfg.maxRequestSize = v
+        default: return
+        }
+        cfg.save()
+        syncPort(cfg.port)          // 端口一改，探测用的 activePort 必须立刻跟上
+        askRestart("参数已更新：\(v.isEmpty ? "默认" : v)")
     }
 
     @objc func pickCustom(_ sender: NSMenuItem) {
-        let isMem = sender.tag == 1
-        guard let v = askString(title: isMem ? "自定义内存上限" : "自定义上下文长度",
-                                message: isMem ? "例如 28G / 512M" : "例如 100K / 32768",
-                                defaultValue: isMem ? cfg.maxMemory : cfg.maxContext),
+        let tag = sender.tag
+        let info = customSpec(tag)
+        guard let v = askString(title: info.title, message: info.message,
+                                defaultValue: info.current),
               !v.isEmpty else { return }
-        if isMem { cfg.maxMemory = v } else { cfg.maxContext = v }
-        cfg.save(); askRestart("参数已更新：\(v)")
+
+        switch tag {
+        case 1:  cfg.maxMemory = v
+        case 2:  cfg.maxContext = v
+        case 3:
+            // 端口必须校验：写进去一个非法值会让服务起不来，而且 lsof 探测也会失效
+            guard let n = Int(v.trimmingCharacters(in: .whitespaces)), n >= 1, n <= 65535 else {
+                alert(title: "端口不合法", message: "需要 1–65535 之间的整数，收到的是「\(v)」")
+                return
+            }
+            cfg.port = String(n)
+        case 4:  cfg.maxRequestSize = v
+        default: return
+        }
+        cfg.save()
+        syncPort(cfg.port)
+        askRestart("参数已更新：\(v)")
+    }
+
+    /// 各参数（tag 1…4）对应的自定义弹窗文案与当前值
+    private func customSpec(_ tag: Int) -> (title: String, message: String, current: String) {
+        switch tag {
+        case 1:  return ("自定义内存上限", "例如 28G / 512M", cfg.maxMemory)
+        case 3:  return ("自定义端口", "1–65535，例如 7000", cfg.port)
+        case 4:  return ("自定义请求体上限", "例如 64M / 1G", cfg.maxRequestSize)
+        default: return ("自定义上下文长度", "例如 100K / 32768", cfg.maxContext)
+        }
     }
 
     @objc func setAPIKey() {
@@ -919,6 +978,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             ? tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             : nil
     }
+
+    private func alert(title: String, message: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = message
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
 }
 
 // MARK: - CLI
@@ -944,7 +1011,7 @@ func runCLI(_ argv: [String]) -> Bool {
           SplashBar --restart    重启
           SplashBar --login-on   注册为登录项（登录时拉起 SplashBar 并自动启动服务）
           SplashBar --login-off  取消登录项
-          SplashBar --takeover   杀掉占用 8000 的外部进程并纳入托管
+          SplashBar --takeover   杀掉占用当前端口的外部进程并纳入托管
           SplashBar --states     打印菜单状态机真值表（含当前实测状态）
           SplashBar --dump-menu  构建真实菜单并打印每项的最终可用性（含 AppKit 校验后的结果）
         """)
@@ -954,6 +1021,7 @@ func runCLI(_ argv: [String]) -> Bool {
     }
 
     let cfg = Config.load()
+    syncPort(cfg.port)              // 同上：CLI 也要先同步端口再探测
     switch cmd {
     case "--status":
         let s = Service.status()

@@ -23,6 +23,9 @@ func syncPort(_ p: String) { activePort = p.isEmpty ? "8000" : p }
 private let kProcPidTBSDInfo: Int32 = 3   // PROC_PIDTBSDINFO（实测返回 136 = sizeof(proc_bsdinfo)）
 // 纯信息行（不可点）的标记，--dump-menu 靠它区分"信息行"和"置灰的功能项"
 private let kInfoTag = 99
+// 参数子菜单用的 tag：1=maxMemory 2=maxContext 3=port 4=maxRequestSize 5=maxImagePixels 6=maxCacheDisk
+// 只有 6 需要具名 —— 它是唯一会因为"引擎不认识"而整组置灰的参数。
+private let kTagCacheDisk = 6
 // sys/proc.h: SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
 // 注意 SSTOP 是 4，写成 3(SSLEEP) 会导致暂停永远检测不到
 private let kSSTOP: UInt32 = 4
@@ -50,6 +53,12 @@ final class Config: Codable {
     var port: String = "8000"
     /// --max-request-size。留空=不传该参数，用 Splash 默认（1.0.1 起为 128M）
     var maxRequestSize: String = ""
+    /// --max-image-pixels。留空=不传该参数，用引擎默认（4194304）
+    var maxImagePixels: String = ""
+    /// --max-cache-disk。留空=不传该参数（即关闭 SSD 缓存层）。
+    /// 注意：这是实验特性，只有上游 PR #3 的 SSD-tier 构建才认识它，
+    /// 正式版（含 1.0.1）传了会让 argparse 直接退出、服务起不来 —— 见 serveArguments 的过滤。
+    var maxCacheDisk: String = ""
     var noWebUI: Bool = false
     var loginItem: Bool = false
     var autoStartOnLaunch: Bool = false
@@ -68,6 +77,8 @@ final class Config: Codable {
         allowedHost       = (try? c.decode(String.self, forKey: .allowedHost)) ?? allowedHost
         port              = (try? c.decode(String.self, forKey: .port)) ?? port
         maxRequestSize    = (try? c.decode(String.self, forKey: .maxRequestSize)) ?? maxRequestSize
+        maxImagePixels    = (try? c.decode(String.self, forKey: .maxImagePixels)) ?? maxImagePixels
+        maxCacheDisk      = (try? c.decode(String.self, forKey: .maxCacheDisk)) ?? maxCacheDisk
         noWebUI           = (try? c.decode(Bool.self, forKey: .noWebUI)) ?? noWebUI
         loginItem         = (try? c.decode(Bool.self, forKey: .loginItem)) ?? loginItem
         autoStartOnLaunch = (try? c.decode(Bool.self, forKey: .autoStartOnLaunch)) ?? autoStartOnLaunch
@@ -93,7 +104,21 @@ final class Config: Codable {
         var a = ["serve", "--model", model, "--max-memory", maxMemory, "--max-context", maxContext]
         // 端口只在非默认时才显式传 --port，这样旧的 Splash（1.0，无此参数）也能照常跑
         if !port.isEmpty && port != "8000" { a += ["--port", port] }
-        if !maxRequestSize.isEmpty { a += ["--max-request-size", maxRequestSize] }
+
+        // 带值的可选 flag 一律先问引擎认不认识。
+        // 传一个 argparse 不认识的选项，splash 会在解析阶段就退出（unrecognized arguments），
+        // 服务根本起不来 —— 比"参数被忽略"严重得多。典型场景：SSD 缓存层只在 PR #3 的分支里，
+        // 用户在实验构建上把 --max-cache-disk 存进配置，之后换回正式版就会踩到。
+        if !maxRequestSize.isEmpty, Service.flagAvailable("--max-request-size") {
+            a += ["--max-request-size", maxRequestSize]
+        }
+        if !maxImagePixels.isEmpty, Service.flagAvailable("--max-image-pixels") {
+            a += ["--max-image-pixels", maxImagePixels]
+        }
+        if !maxCacheDisk.isEmpty, Service.flagAvailable("--max-cache-disk") {
+            a += ["--max-cache-disk", maxCacheDisk]
+        }
+
         if !allowedHost.isEmpty { a += ["--allowed-host", allowedHost] }
         if noWebUI { a += ["--no-webui"] }
         return a
@@ -279,6 +304,39 @@ enum Service {
         }
         return installedCache
     }
+
+    // MARK: 引擎能力探测
+
+    /// `splash serve --help` 里出现的所有长选项名（形如 "--max-cache-disk"）。
+    /// 只探测一次并缓存 —— 同样要 spawn 一个 Python。
+    private static var serveFlagsCache: Set<String>?
+
+    static func serveFlags() -> Set<String> {
+        if let c = serveFlagsCache { return c }
+        let r = run(kSplashBin, ["serve", "--help"])
+        let text = r.out + r.err
+        var flags: Set<String> = []
+        var i = text.startIndex
+        while let rng = text.range(of: "--", range: i..<text.endIndex) {
+            let name = text[rng.upperBound...].prefix { $0.isLetter || $0.isNumber || $0 == "-" }
+            if name.count >= 2 { flags.insert("--" + name) }
+            i = rng.upperBound
+        }
+        serveFlagsCache = flags
+        return flags
+    }
+
+    /// 引擎是否认识某个可选 flag。
+    /// 探测失败（拿到空集，例如 splash 不在 PATH）时返回 true：
+    /// 宁可让菜单项保持可用，也不要误判成"不支持"、把用户存好的配置悄悄丢掉。
+    /// `serve --help` 不需要模型，所以服务没在跑时也能安全调用。
+    static func flagAvailable(_ flag: String) -> Bool {
+        let known = serveFlags()
+        return known.isEmpty ? true : known.contains(flag)
+    }
+
+    /// 探测是否成功（用于区分"引擎确实不支持"和"根本问不到引擎"）
+    static var flagsProbed: Bool { !serveFlags().isEmpty }
 
     static func start(cfg: Config) -> String {
         if managed { return "already running (pid \(recordedPID!))" }
@@ -559,9 +617,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 options: [("", "128M (Splash 1.0.1 default — flag omitted)"),
                           ("64M", "64M"), ("256M", "256M"), ("512M", "512M"), ("1G", "1G")],
                 customLabel: "Custom… (e.g. 32M)", tag: 4)),
+            submenuItem("Max image pixels  --max-image-pixels", items: choiceItems(
+                current: cfg.maxImagePixels,
+                options: [("", "Engine default (4194304)"),
+                          ("1048576", "1M  = 1048576"), ("2097152", "2M  = 2097152"),
+                          ("4194304", "4M  = 4194304"), ("8388608", "8M  = 8388608")],
+                customLabel: "Custom… (pixel count)", tag: 5)),
             submenuItem("API Key  --api-key", items: apiKeyItems()),
             submenuItem("Allowed host  --allowed-host", items: hostItems()),
             submenuItem("Web UI  --no-webui", items: webUIItems()),
+            // 实验特性放最后：正式版引擎不认识这个 flag
+            submenuItem("Max cache disk  --max-cache-disk", items: cacheDiskItems()),
         ]))
 
         // ── 打开：5 个入口收进一个子菜单（原来平铺占 5 行）
@@ -726,6 +792,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return [on, off]
     }
 
+    /// SSD 缓存层（--max-cache-disk）——上游 PR #3 的实验特性，只有从
+    /// `engine/cache-disk-tier` 分支构建的引擎才认识它。正式版传了会让服务起不来，
+    /// 所以这里按引擎实际能力决定是否可点，而不是无条件摆出来。
+    private func cacheDiskItems() -> [NSMenuItem] {
+        var items: [NSMenuItem] = []
+        let supported = Service.flagAvailable("--max-cache-disk")
+        if !supported && Service.flagsProbed {
+            let ver = Service.installedVersion() ?? "?"
+            items.append(disabled("Engine \(ver) has no --max-cache-disk"))
+            items.append(disabled("Needs the upstream PR #3 SSD-tier build"))
+            items.append(.separator())
+        } else if !Service.flagsProbed {
+            items.append(disabled("Could not query the engine — proceeding blind"))
+            items.append(.separator())
+        }
+
+        let choices = choiceItems(
+            current: cfg.maxCacheDisk,
+            options: [("", "Off (default)"),
+                      ("8G", "8G"), ("16G", "16G"), ("32G", "32G"), ("64G", "64G")],
+            customLabel: "Custom… (e.g. 12G)", tag: kTagCacheDisk)
+
+        // 引擎不支持就整组置灰：选了也发不出去（serveArguments 会过滤掉），
+        // 与其让用户以为生效了，不如明确告诉他现在用不了。
+        if !supported {
+            for it in choices where !it.isSeparatorItem { it.isEnabled = false }
+        }
+        items.append(contentsOf: choices)
+        return items
+    }
+
     private func installedModels() -> [String] {
         let fm = FileManager.default
         var out: [String] = []
@@ -864,6 +961,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case 2:  cfg.maxContext = v
         case 3:  cfg.port = v
         case 4:  cfg.maxRequestSize = v
+        case 5:  cfg.maxImagePixels = v
+        case 6:  cfg.maxCacheDisk = v
         default: return
         }
         cfg.save()
@@ -889,6 +988,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
             cfg.port = String(n)
         case 4:  cfg.maxRequestSize = v
+        case 5:  cfg.maxImagePixels = v
+        case 6:  cfg.maxCacheDisk = v
         default: return
         }
         cfg.save()
@@ -902,6 +1003,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case 1:  return ("Custom max memory", "e.g. 28G / 512M", cfg.maxMemory)
         case 3:  return ("Custom port", "1-65535, e.g. 7000", cfg.port)
         case 4:  return ("Custom max request size", "e.g. 64M / 1G", cfg.maxRequestSize)
+        case 5:  return ("Custom max image pixels", "integer pixel count, e.g. 4194304", cfg.maxImagePixels)
+        case 6:  return ("Custom max cache disk", "e.g. 8G / 12G / 64G", cfg.maxCacheDisk)
         default: return ("Custom context length", "e.g. 100K / 32768", cfg.maxContext)
         }
     }
@@ -1008,6 +1111,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if a == #selector(takeOver)       { return p.canTakeOver }
         if a == #selector(openWebUI)      { return p.canOpenUI && !cfg.noWebUI }
         if a == #selector(clearAPIKey)    { return !cfg.apiKey.isEmpty }
+        // 引擎不认识的参数：哪怕 autoenablesItems 被谁打开了，也不允许点
+        if menuItem.tag == kTagCacheDisk, !Service.flagAvailable("--max-cache-disk") { return false }
         return true
     }
 
@@ -1064,7 +1169,8 @@ func runCLI(_ argv: [String]) -> Bool {
     let cmd = argv[1]
     switch cmd {
     case "--start", "--stop", "--restart", "--status", "--states", "--takeover",
-         "--pause", "--resume", "--login-on", "--login-off", "--dump-menu", "--version-of":
+         "--pause", "--resume", "--login-on", "--login-off", "--dump-menu", "--version-of",
+         "--engine-flags":
         break
     case "--help", "-h":
         print("""
@@ -1082,6 +1188,7 @@ func runCLI(_ argv: [String]) -> Bool {
           SplashBar --states     Print the menu state-machine truth table plus the live state
           SplashBar --dump-menu  Build the real menu and recursively print item availability (post-AppKit-validation)
           SplashBar --version-of <path>  Run the version parser against an executable path (debug)
+          SplashBar --engine-flags  List the serve flags this engine accepts, and which get filtered (debug)
         """)
         return true
     default:
@@ -1187,6 +1294,16 @@ func runCLI(_ argv: [String]) -> Bool {
         print("http: \(Service.status().up ? "ok" : "no response")")
     case "--pause":
         print(Service.pause())
+    case "--engine-flags":
+        // 调试验证用：看引擎到底认哪些 flag，以及当前配置里有没有被过滤掉的
+        let known = Service.serveFlags().sorted()
+        print("engine:  \(Service.installedVersion() ?? "?")")
+        print("probed:  \(Service.flagsProbed ? "ok" : "FAILED — assuming every flag is supported")")
+        print("flags:   \(known.isEmpty ? "(none)" : known.joined(separator: " "))")
+        for f in ["--port", "--max-request-size", "--max-image-pixels", "--max-cache-disk"] {
+            print("  \(Service.flagAvailable(f) ? "✅" : "❌") \(f)")
+        }
+        print("args:    \(cfg.serveArguments.joined(separator: " "))")
     case "--version-of":
         // 调试验证用：把一条可执行文件路径喂给版本解析逻辑
         guard argv.count >= 3 else { print("usage: --version-of <path>"); return true }

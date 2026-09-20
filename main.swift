@@ -23,9 +23,44 @@ func syncPort(_ p: String) { activePort = p.isEmpty ? "8000" : p }
 private let kProcPidTBSDInfo: Int32 = 3   // PROC_PIDTBSDINFO（实测返回 136 = sizeof(proc_bsdinfo)）
 // 纯信息行（不可点）的标记，--dump-menu 靠它区分"信息行"和"置灰的功能项"
 private let kInfoTag = 99
-// 参数子菜单用的 tag：1=maxMemory 2=maxContext 3=port 4=maxRequestSize 5=maxImagePixels 6=maxCacheDisk
-// 只有 6 需要具名 —— 它是唯一会因为"引擎不认识"而整组置灰的参数。
-private let kTagCacheDisk = 6
+// 参数子菜单用的 tag。全部具名，并且统一走 AppDelegate.flagForTag 这张
+// tag → flag 映射表 —— "菜单置灰 / 拼命令行时过滤 / validateMenuItem 兜底"三处共用一份真相。
+// 以前只硬编码了 kTagCacheDisk，因为当时只有它会因"引擎不认识"而置灰；
+// 结果是 Max request size / Max image pixels 的值会被静默丢弃、菜单却仍显示可选。
+private let kTagMaxMemory      = 1
+private let kTagMaxContext     = 2
+private let kTagPort           = 3
+private let kTagMaxRequestSize = 4
+private let kTagMaxImagePixels = 5
+private let kTagCacheDisk      = 6
+private let kTagAllowedHost    = 7
+private let kTagWebUI          = 8
+
+/// 受引擎能力约束的参数：tag → 引擎上对应的长选项。
+///
+/// **这是唯一真相来源** —— 菜单置灰（`gatedSubmenu`）、拼命令行时过滤（`Config.serveArguments`）、
+/// `validateMenuItem` 兜底、`--engine-flags` 诊断，四处都查这张表。
+/// 以前只有 cache-disk 一项做了全链路门控，导致 Max request size / Max image pixels 的配置值
+/// 会被静默丢弃而菜单照旧可选；改参数时只改这里就不会再漏。
+///
+/// 不在表里的两项：
+///   - Model：位置参数，永远要传
+///   - API Key：通过环境变量 `SPLASH_API_KEY` 注入（`--api-key` 的 default 就是它），
+///     环境变量不可能触发 argparse 退出，无需探测
+private let kGatedParams: [(tag: Int, flag: String)] = [
+    (kTagMaxMemory,      "--max-memory"),
+    (kTagMaxContext,     "--max-context"),
+    (kTagPort,           "--port"),
+    (kTagMaxRequestSize, "--max-request-size"),
+    (kTagMaxImagePixels, "--max-image-pixels"),
+    (kTagCacheDisk,      "--max-cache-disk"),
+    (kTagAllowedHost,    "--allowed-host"),
+    (kTagWebUI,          "--no-webui"),
+]
+
+private func flagForTag(_ tag: Int) -> String? {
+    kGatedParams.first { $0.tag == tag }?.flag
+}
 // sys/proc.h: SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
 // 注意 SSTOP 是 4，写成 3(SSLEEP) 会导致暂停永远检测不到
 private let kSSTOP: UInt32 = 4
@@ -111,15 +146,25 @@ final class Config: Codable {
         if let data = try? enc.encode(self) { try? data.write(to: configURL) }
     }
 
+    /// 拼出 `splash serve` 的参数。
+    ///
+    /// **除了 `--model`，其余每一个 flag 都先问引擎认不认识。** 传一个 argparse 不认识的选项，
+    /// splash 会在解析阶段就退出（`unrecognized arguments`），服务根本起不来 ——
+    /// 比"参数被忽略"严重得多。典型场景：SSD 缓存层只在 PR #3 的分支里，
+    /// 用户在实验构建上把 `--max-cache-disk` 存进配置，之后换回正式版就会踩到。
+    ///
+    /// 这里必须和 `gatedSubmenu` 的置灰范围**完全一致**：菜单里灰掉的项如果还被拼进命令行，
+    /// 就不是"参数失效"而是"服务起不来"了。
+    /// 探测失败时 `flagAvailable` 返回 true（fail open），参数照旧传 —— 不能因为问不到引擎
+    /// 就把用户存好的配置悄悄丢掉。
     var serveArguments: [String] {
-        var a = ["serve", "--model", model, "--max-memory", maxMemory, "--max-context", maxContext]
-        // 端口只在非默认时才显式传 --port，这样旧的 Splash（1.0，无此参数）也能照常跑
-        if !port.isEmpty && port != "8000" { a += ["--port", port] }
-
-        // 带值的可选 flag 一律先问引擎认不认识。
-        // 传一个 argparse 不认识的选项，splash 会在解析阶段就退出（unrecognized arguments），
-        // 服务根本起不来 —— 比"参数被忽略"严重得多。典型场景：SSD 缓存层只在 PR #3 的分支里，
-        // 用户在实验构建上把 --max-cache-disk 存进配置，之后换回正式版就会踩到。
+        var a = ["serve", "--model", model]
+        if Service.flagAvailable("--max-memory")  { a += ["--max-memory", maxMemory] }
+        if Service.flagAvailable("--max-context") { a += ["--max-context", maxContext] }
+        // 端口只在非默认时才显式传，这样旧的 Splash（1.0，无此参数）也能照常跑
+        if !port.isEmpty && port != "8000", Service.flagAvailable("--port") {
+            a += ["--port", port]
+        }
         if !maxRequestSize.isEmpty, Service.flagAvailable("--max-request-size") {
             a += ["--max-request-size", maxRequestSize]
         }
@@ -129,9 +174,10 @@ final class Config: Codable {
         if !maxCacheDisk.isEmpty, Service.flagAvailable("--max-cache-disk") {
             a += ["--max-cache-disk", maxCacheDisk]
         }
-
-        if !allowedHost.isEmpty { a += ["--allowed-host", allowedHost] }
-        if noWebUI { a += ["--no-webui"] }
+        if !allowedHost.isEmpty, Service.flagAvailable("--allowed-host") {
+            a += ["--allowed-host", allowedHost]
+        }
+        if noWebUI, Service.flagAvailable("--no-webui") { a += ["--no-webui"] }
         return a
     }
 }
@@ -635,41 +681,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(.separator())
 
         // ── 参数设置：8 个参数子菜单收进一个入口（原来平铺占 8 行）
-        menu.addItem(submenuItem("Settings", items: [
+        // 除 Model / API Key 外，每个子菜单都走 gatedSubmenu —— 引擎不认识的会自动整组置灰。
+        var settingsItems: [NSMenuItem] = []
+        // 探测失败时在这里统一说一次，而不是在 8 个子菜单里各说一遍。
+        // 此时所有参数都保持可选（fail open），提示只是让用户知道"没探测到引擎"。
+        if !Service.flagsProbed {
+            settingsItems.append(disabled("Could not query the engine — options left enabled"))
+            settingsItems.append(.separator())
+        }
+        settingsItems += [
             submenuItem("Model", items: modelItems()),
-            submenuItem("Max memory  --max-memory", items: choiceItems(
+            gatedSubmenu("Max memory  --max-memory", tag: kTagMaxMemory, items: choiceItems(
                 current: cfg.maxMemory,
                 options: [("auto", "auto (≈107 GB, M5 Max limit)"),
                           ("24G", "24G"), ("32G", "32G"), ("48G", "48G"),
                           ("64G", "64G"), ("96G", "96G")],
-                customLabel: "Custom… (e.g. 28G)", tag: 1)),
-            submenuItem("Context  --max-context", items: choiceItems(
+                customLabel: "Custom… (e.g. 28G)", tag: kTagMaxMemory)),
+            gatedSubmenu("Context  --max-context", tag: kTagMaxContext, items: choiceItems(
                 current: cfg.maxContext,
                 options: [("auto", "auto (262144 = 256K)"),
                           ("32K", "32K"), ("64K", "64K"), ("128K", "128K"), ("256K", "256K")],
-                customLabel: "Custom… (e.g. 100K)", tag: 2)),
-            submenuItem("Port  --port", items: choiceItems(
+                customLabel: "Custom… (e.g. 100K)", tag: kTagMaxContext)),
+            gatedSubmenu("Port  --port", tag: kTagPort, items: choiceItems(
                 current: cfg.port,
                 options: [("8000", "8000 (Splash default)"),
                           ("8080", "8080"), ("8123", "8123"), ("9000", "9000")],
-                customLabel: "Custom… (e.g. 7000)", tag: 3)),
-            submenuItem("Max request size  --max-request-size", items: choiceItems(
+                customLabel: "Custom… (e.g. 7000)", tag: kTagPort)),
+            gatedSubmenu("Max request size  --max-request-size", tag: kTagMaxRequestSize, items: choiceItems(
                 current: cfg.maxRequestSize,
                 options: [("", "128M (Splash 1.0.1 default — flag omitted)"),
                           ("64M", "64M"), ("256M", "256M"), ("512M", "512M"), ("1G", "1G")],
-                customLabel: "Custom… (e.g. 32M)", tag: 4)),
-            submenuItem("Max image pixels  --max-image-pixels", items: choiceItems(
+                customLabel: "Custom… (e.g. 32M)", tag: kTagMaxRequestSize)),
+            gatedSubmenu("Max image pixels  --max-image-pixels", tag: kTagMaxImagePixels, items: choiceItems(
                 current: cfg.maxImagePixels,
                 options: [("", "Engine default (4194304)"),
                           ("1048576", "1M  = 1048576"), ("2097152", "2M  = 2097152"),
                           ("4194304", "4M  = 4194304"), ("8388608", "8M  = 8388608")],
-                customLabel: "Custom… (pixel count)", tag: 5)),
-            submenuItem("API Key  --api-key", items: apiKeyItems()),
-            submenuItem("Allowed host  --allowed-host", items: hostItems()),
-            submenuItem("Web UI  --no-webui", items: webUIItems()),
+                customLabel: "Custom… (pixel count)", tag: kTagMaxImagePixels)),
+            // 这一项不是 CLI 参数：SplashBar 通过环境变量注入（--api-key 的 default 就是它）
+            submenuItem("API Key  $SPLASH_API_KEY", items: apiKeyItems()),
+            gatedSubmenu("Allowed host  --allowed-host", tag: kTagAllowedHost, items: hostItems()),
+            gatedSubmenu("Web UI  --no-webui", tag: kTagWebUI, items: webUIItems()),
             // 实验特性放最后：正式版引擎不认识这个 flag
-            submenuItem("Max cache disk  --max-cache-disk", items: cacheDiskItems()),
-        ]))
+            gatedSubmenu("Max cache disk  --max-cache-disk", tag: kTagCacheDisk, items: choiceItems(
+                current: cfg.maxCacheDisk,
+                options: [("", "Off (default)"),
+                          ("8G", "8G"), ("16G", "16G"), ("32G", "32G"), ("64G", "64G")],
+                customLabel: "Custom… (e.g. 12G)", tag: kTagCacheDisk)),
+        ]
+        menu.addItem(submenuItem("Settings", items: settingsItems))
 
         // ── 打开：5 个入口收进一个子菜单（原来平铺占 5 行）
         let openUI = NSMenuItem(title: "Open Web UI in browser", action: #selector(openWebUI), keyEquivalent: "o")
@@ -767,6 +827,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return it
     }
 
+    /// 建一个"受引擎能力约束"的参数子菜单。三件事一次做完，不靠调用方记得：
+    ///   1. 引擎不认识该 flag 时**整组置灰** —— 否则用户以为选了就生效，
+    ///      其实 `serveArguments` 会把它丢掉（更糟的情况是没过滤，服务直接起不来）
+    ///   2. 补一行说明"为什么不能选" —— 只置灰不解释，用户会以为是自己配错了
+    ///   3. 选项带 tag，`validateMenuItem` 用同一张表兜底
+    ///
+    /// 探测失败（`serve --help` 都问不到）时**保持全部可用**：fail open。
+    /// 宁可让用户能点，也不要因为问不到引擎就把他存好的配置判成无效。
+    private func gatedSubmenu(_ title: String, tag: Int, items: [NSMenuItem]) -> NSMenuItem {
+        guard let flag = flagForTag(tag),
+              Service.flagsProbed,
+              !Service.flagAvailable(flag) else {
+            return submenuItem(title, items: items)
+        }
+
+        var header: [NSMenuItem] = [disabled("Engine \(Service.installedVersion() ?? "?") has no \(flag)")]
+        // SSD 缓存层来自上游未合并的 PR #3，光说"不支持"不够，得告诉用户去哪儿弄
+        if flag == "--max-cache-disk" {
+            header.append(disabled("Needs the upstream PR #3 SSD-tier build"))
+        }
+        header.append(.separator())
+
+        for it in items where !it.isSeparatorItem { it.isEnabled = false }
+        return submenuItem(title, items: header + items)
+    }
+
     private func choiceItems(current: String, options: [(String, String)],
                              customLabel: String, tag: Int) -> [NSMenuItem] {
         var items = options.map { value, label -> NSMenuItem in
@@ -814,11 +900,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func hostItems() -> [NSMenuItem] {
         let only = NSMenuItem(title: "Localhost only (127.0.0.1)", action: #selector(clearHost), keyEquivalent: "")
         only.target = self
+        only.tag = kTagAllowedHost
         only.state = cfg.allowedHost.isEmpty ? .on : .off
         var items = [only, NSMenuItem.separator()]
         if !cfg.allowedHost.isEmpty { items.append(disabled("Current: \(cfg.allowedHost)")) }
         let set = NSMenuItem(title: "Allow LAN access…", action: #selector(setHost), keyEquivalent: "")
         set.target = self
+        set.tag = kTagAllowedHost
         items.append(set)
         return items
     }
@@ -826,42 +914,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func webUIItems() -> [NSMenuItem] {
         let on = NSMenuItem(title: "On (default)", action: #selector(setWebUIOn), keyEquivalent: "")
         on.target = self
+        on.tag = kTagWebUI
         on.state = cfg.noWebUI ? .off : .on
         let off = NSMenuItem(title: "Off --no-webui", action: #selector(setWebUIOff), keyEquivalent: "")
         off.target = self
+        off.tag = kTagWebUI
         off.state = cfg.noWebUI ? .on : .off
         return [on, off]
-    }
-
-    /// SSD 缓存层（--max-cache-disk）——上游 PR #3 的实验特性，只有从
-    /// `engine/cache-disk-tier` 分支构建的引擎才认识它。正式版传了会让服务起不来，
-    /// 所以这里按引擎实际能力决定是否可点，而不是无条件摆出来。
-    private func cacheDiskItems() -> [NSMenuItem] {
-        var items: [NSMenuItem] = []
-        let supported = Service.flagAvailable("--max-cache-disk")
-        if !supported && Service.flagsProbed {
-            let ver = Service.installedVersion() ?? "?"
-            items.append(disabled("Engine \(ver) has no --max-cache-disk"))
-            items.append(disabled("Needs the upstream PR #3 SSD-tier build"))
-            items.append(.separator())
-        } else if !Service.flagsProbed {
-            items.append(disabled("Could not query the engine — proceeding blind"))
-            items.append(.separator())
-        }
-
-        let choices = choiceItems(
-            current: cfg.maxCacheDisk,
-            options: [("", "Off (default)"),
-                      ("8G", "8G"), ("16G", "16G"), ("32G", "32G"), ("64G", "64G")],
-            customLabel: "Custom… (e.g. 12G)", tag: kTagCacheDisk)
-
-        // 引擎不支持就整组置灰：选了也发不出去（serveArguments 会过滤掉），
-        // 与其让用户以为生效了，不如明确告诉他现在用不了。
-        if !supported {
-            for it in choices where !it.isSeparatorItem { it.isEnabled = false }
-        }
-        items.append(contentsOf: choices)
-        return items
     }
 
     /// 本地已有的 Splash 包，两个来源合并：
@@ -1020,12 +1079,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func pickValue(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? String else { return }
         switch sender.tag {
-        case 1:  cfg.maxMemory = v
-        case 2:  cfg.maxContext = v
-        case 3:  cfg.port = v
-        case 4:  cfg.maxRequestSize = v
-        case 5:  cfg.maxImagePixels = v
-        case 6:  cfg.maxCacheDisk = v
+        case kTagMaxMemory:      cfg.maxMemory = v
+        case kTagMaxContext:     cfg.maxContext = v
+        case kTagPort:           cfg.port = v
+        case kTagMaxRequestSize: cfg.maxRequestSize = v
+        case kTagMaxImagePixels: cfg.maxImagePixels = v
+        case kTagCacheDisk:      cfg.maxCacheDisk = v
         default: return
         }
         cfg.save()
@@ -1041,18 +1100,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
               !v.isEmpty else { return }
 
         switch tag {
-        case 1:  cfg.maxMemory = v
-        case 2:  cfg.maxContext = v
-        case 3:
+        case kTagMaxMemory:      cfg.maxMemory = v
+        case kTagMaxContext:     cfg.maxContext = v
+        case kTagPort:
             // 端口必须校验：写进去一个非法值会让服务起不来，而且 lsof 探测也会失效
             guard let n = Int(v.trimmingCharacters(in: .whitespaces)), n >= 1, n <= 65535 else {
                 alert(title: "Invalid port", message: "Expected an integer between 1 and 65535, got \"\(v)\"")
                 return
             }
             cfg.port = String(n)
-        case 4:  cfg.maxRequestSize = v
-        case 5:  cfg.maxImagePixels = v
-        case 6:  cfg.maxCacheDisk = v
+        case kTagMaxRequestSize: cfg.maxRequestSize = v
+        case kTagMaxImagePixels: cfg.maxImagePixels = v
+        case kTagCacheDisk:      cfg.maxCacheDisk = v
         default: return
         }
         cfg.save()
@@ -1060,15 +1119,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         askRestart("Setting updated: \(v)")
     }
 
-    /// 各参数（tag 1…4）对应的自定义弹窗文案与当前值
+    /// 各参数（tag 1…6）对应的自定义弹窗文案与当前值
     private func customSpec(_ tag: Int) -> (title: String, message: String, current: String) {
         switch tag {
-        case 1:  return ("Custom max memory", "e.g. 28G / 512M", cfg.maxMemory)
-        case 3:  return ("Custom port", "1-65535, e.g. 7000", cfg.port)
-        case 4:  return ("Custom max request size", "e.g. 64M / 1G", cfg.maxRequestSize)
-        case 5:  return ("Custom max image pixels", "integer pixel count, e.g. 4194304", cfg.maxImagePixels)
-        case 6:  return ("Custom max cache disk", "e.g. 8G / 12G / 64G", cfg.maxCacheDisk)
-        default: return ("Custom context length", "e.g. 100K / 32768", cfg.maxContext)
+        case kTagMaxMemory:      return ("Custom max memory", "e.g. 28G / 512M", cfg.maxMemory)
+        case kTagMaxContext:     return ("Custom context length", "e.g. 100K / 32768", cfg.maxContext)
+        case kTagPort:           return ("Custom port", "1-65535, e.g. 7000", cfg.port)
+        case kTagMaxRequestSize: return ("Custom max request size", "e.g. 64M / 1G", cfg.maxRequestSize)
+        case kTagMaxImagePixels: return ("Custom max image pixels", "integer pixel count, e.g. 4194304", cfg.maxImagePixels)
+        case kTagCacheDisk:      return ("Custom max cache disk", "e.g. 8G / 12G / 64G", cfg.maxCacheDisk)
+        default:                 return ("Custom context length", "e.g. 100K / 32768", cfg.maxContext)
         }
     }
 
@@ -1174,8 +1234,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if a == #selector(takeOver)       { return p.canTakeOver }
         if a == #selector(openWebUI)      { return p.canOpenUI && !cfg.noWebUI }
         if a == #selector(clearAPIKey)    { return !cfg.apiKey.isEmpty }
-        // 引擎不认识的参数：哪怕 autoenablesItems 被谁打开了，也不允许点
-        if menuItem.tag == kTagCacheDisk, !Service.flagAvailable("--max-cache-disk") { return false }
+        // 引擎不认识的参数：哪怕 autoenablesItems 被谁打开了，也不允许点。
+        // 走和 rebuildMenu 同一张 tag→flag 表，保证两处判定范围永远一致
+        // （曾经这里只兜底 cache-disk，另外两个同样会被过滤掉的 flag 漏了）。
+        if let flag = flagForTag(menuItem.tag), !Service.flagAvailable(flag) { return false }
         return true
     }
 
@@ -1398,8 +1460,10 @@ func runCLI(_ argv: [String]) -> Bool {
         print("engine:  \(Service.installedVersion() ?? "?")")
         print("probed:  \(Service.flagsProbed ? "ok" : "FAILED — assuming every flag is supported")")
         print("flags:   \(known.isEmpty ? "(none)" : known.joined(separator: " "))")
-        for f in ["--port", "--max-request-size", "--max-image-pixels", "--max-cache-disk"] {
-            print("  \(Service.flagAvailable(f) ? "✅" : "❌") \(f)")
+        // 逐项列出受门控的参数 —— 范围与顺序都取自 kGatedParams，
+        // 也就是菜单置灰 / serveArguments 过滤的同一张表
+        for p in kGatedParams {
+            print("  \(Service.flagAvailable(p.flag) ? "✅" : "❌") \(p.flag)")
         }
         print("args:    \(cfg.serveArguments.joined(separator: " "))")
     case "--version-of":

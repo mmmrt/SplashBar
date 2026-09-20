@@ -28,35 +28,6 @@ open ~/Applications/SplashBar.app
 Needs Xcode Command Line Tools (`xcrun swiftc`, `iconutil`).
 No window, no Dock icon — it lives in the menu bar.
 
-## Usage
-
-Click the icon. The menu shows live stats on top, controls in the middle, and serve settings below.
-
-| State | Start | Pause | Stop | Restart |
-|---|---|---|---|---|
-| Stopped | ✅ | ── | ── | ── |
-| Running | ── | ✅ | ✅ | ✅ |
-| Paused | ✅ (Resume) | ── | ✅ | ✅ |
-
-Config lives at `~/Library/Application Support/SplashBar/config.json` and can be edited from the menu
-or by hand.
-
-The binary also works as a CLI:
-
-```bash
-~/Applications/SplashBar.app/Contents/MacOS/SplashBar --status   # or --start --pause --resume --stop --restart --takeover --help
-```
-
-## Layout
-
-```
-main.swift        menu bar UI, state machine, process control, CLI
-makeicons.swift   CoreGraphics icon generator
-build.sh          one-shot build
-Info.plist        bundle metadata
-preview/          icon previews
-```
-
 ## License
 
 MIT

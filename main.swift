@@ -41,6 +41,17 @@ private var splashModelsDir: URL {
     homeURL().appendingPathComponent("Library/Application Support/Splash/models")
 }
 
+/// Splash 真正把模型包落盘的地方（HF 缓存约定）。
+/// 顺序：HF_HUB_CACHE → $HF_HOME/hub → ~/.cache/huggingface/hub
+private var hfHubDir: URL {
+    let env = ProcessInfo.processInfo.environment
+    if let h = env["HF_HUB_CACHE"], !h.isEmpty { return URL(fileURLWithPath: h) }
+    if let h = env["HF_HOME"], !h.isEmpty {
+        return URL(fileURLWithPath: h).appendingPathComponent("hub")
+    }
+    return homeURL().appendingPathComponent(".cache/huggingface/hub")
+}
+
 // MARK: - 配置
 
 final class Config: Codable {
@@ -261,6 +272,7 @@ enum Service {
     /// `…/Cellar/splash/<ver>/libexec/python/bin/python3.13`（brew 装）
     /// 或 `…/splash-<ver>-arm64-macos26/…`（release 包解包后手动跑）。
     static func runningVersion() -> String? {
+        invalidateCachesIfEngineChanged()
         guard let pid = recordedPID, isAlive(pid) else { return nil }
         if let cached = versionCache, cached.pid == pid { return cached.version }
         let r = run("/usr/sbin/lsof", ["-p", String(pid), "-a", "-d", "txt", "-Fn"])
@@ -294,6 +306,7 @@ enum Service {
     /// 「已安装」的版本（`splash --version` → "Splash 1.0.1"）。
     /// 会拉起一个 Python，耗时约 0.3–1s，所以只查一次然后缓存。
     static func installedVersion() -> String? {
+        invalidateCachesIfEngineChanged()
         if installedQueried { return installedCache }
         installedQueried = true
         let r = run(kSplashBin, ["--version"])
@@ -307,11 +320,39 @@ enum Service {
 
     // MARK: 引擎能力探测
 
+    /// 引擎身份指纹 —— 用来判断"引擎被换过了"。
+    /// brew 的 bin 是指向 Cellar 版本的符号链接，读字符串即可、不用起进程，
+    /// 所以每次建菜单都能安全调用。附上解析后二进制的 mtime，
+    /// 兜住"同版本原地重装"这种链接目标不变的情况。
+    private static func engineFingerprint() -> String {
+        let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: kSplashBin)) ?? kSplashBin
+        let resolved = URL(fileURLWithPath: kSplashBin).resolvingSymlinksInPath().path
+        let attrs = try? FileManager.default.attributesOfItem(atPath: resolved)
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(link)|\(resolved)|\(Int(mtime))"
+    }
+
+    private static var cachedFingerprint: String?
+
+    /// 引擎换了（升级 / 降级 / 重装）就让所有探测缓存失效。
+    /// 没有这一步，用户装完支持 --max-cache-disk 的引擎还得重启 SplashBar
+    /// 那一项才会从置灰变可用 —— 而"装上就自动可用"正是这里承诺的行为。
+    private static func invalidateCachesIfEngineChanged() {
+        let fp = engineFingerprint()
+        if cachedFingerprint == fp { return }
+        cachedFingerprint = fp
+        serveFlagsCache = nil
+        installedQueried = false
+        installedCache = nil
+        versionCache = nil
+    }
+
     /// `splash serve --help` 里出现的所有长选项名（形如 "--max-cache-disk"）。
     /// 只探测一次并缓存 —— 同样要 spawn 一个 Python。
     private static var serveFlagsCache: Set<String>?
 
     static func serveFlags() -> Set<String> {
+        invalidateCachesIfEngineChanged()
         if let c = serveFlagsCache { return c }
         let r = run(kSplashBin, ["serve", "--help"])
         let text = r.out + r.err
@@ -823,22 +864,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return items
     }
 
-    private func installedModels() -> [String] {
+    /// 本地已有的 Splash 包，两个来源合并：
+    ///   1) App 托管目录 —— Splash 服务过的模型会在这里留下符号链接
+    ///   2) HF 缓存 —— 真正落盘的位置，包装配好就在这里
+    /// 只看 (1) 会漏掉"已下载装配、但还没被服务过"的包，那样新下的模型在菜单里根本不出现，
+    /// 只能靠 "Custom owner/repo…" 手打全名 —— 而用户刚下完一个包时最想看到的
+    /// 恰恰是它能直接选。
+    fileprivate func installedModels() -> [String] {
         let fm = FileManager.default
-        var out: [String] = []
+        var out = Set<String>()
+
+        // 1) App 托管目录：<models>/<owner>/<name>
         if let owners = try? fm.contentsOfDirectory(atPath: splashModelsDir.path) {
             for owner in owners where !owner.hasPrefix(".") {
                 let dir = splashModelsDir.appendingPathComponent(owner)
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
                 if let names = try? fm.contentsOfDirectory(atPath: dir.path) {
-                    for name in names where !name.hasPrefix(".") { out.append("\(owner)/\(name)") }
+                    for name in names where !name.hasPrefix(".") { out.insert("\(owner)/\(name)") }
                 }
             }
         }
-        if out.isEmpty { out = ["incoai/Qwen3.8-27B-Splash", "incoai/Qwen3.6-35B-A3B-Splash"] }
-        if !out.contains(cfg.model) { out.append(cfg.model) }
-        return out.sorted()
+
+        // 2) HF 缓存：models--<owner>--<name>
+        // repo 名里本身可能含 "--"，所以只按第一处分隔（和 huggingface_hub 的解析方式一致）。
+        if let entries = try? fm.contentsOfDirectory(atPath: hfHubDir.path) {
+            for e in entries where e.hasPrefix("models--") {
+                let body = e.dropFirst("models--".count)
+                guard let sep = body.range(of: "--") else { continue }
+                let owner = String(body[body.startIndex..<sep.lowerBound])
+                let name  = String(body[sep.upperBound...])
+                if !owner.isEmpty && !name.isEmpty { out.insert("\(owner)/\(name)") }
+            }
+        }
+
+        var list = out.sorted()
+        if list.isEmpty { list = ["incoai/Qwen3.8-27B-Splash", "incoai/Qwen3.6-35B-A3B-Splash"] }
+        if !list.contains(cfg.model) { list.append(cfg.model) }
+        return list
     }
 
     // MARK: 动作
@@ -1170,7 +1233,7 @@ func runCLI(_ argv: [String]) -> Bool {
     switch cmd {
     case "--start", "--stop", "--restart", "--status", "--states", "--takeover",
          "--pause", "--resume", "--login-on", "--login-off", "--dump-menu", "--version-of",
-         "--engine-flags":
+         "--engine-flags", "--models":
         break
     case "--help", "-h":
         print("""
@@ -1189,6 +1252,7 @@ func runCLI(_ argv: [String]) -> Bool {
           SplashBar --dump-menu  Build the real menu and recursively print item availability (post-AppKit-validation)
           SplashBar --version-of <path>  Run the version parser against an executable path (debug)
           SplashBar --engine-flags  List the serve flags this engine accepts, and which get filtered (debug)
+          SplashBar --models     List locally available Splash packages as the Model submenu sees them (debug)
         """)
         return true
     default:
@@ -1294,6 +1358,40 @@ func runCLI(_ argv: [String]) -> Bool {
         print("http: \(Service.status().up ? "ok" : "no response")")
     case "--pause":
         print(Service.pause())
+    case "--models":
+        // 调试验证用：看 Model 子菜单会列出哪些本地已有的包，以及它们来自哪个来源
+        let fm = FileManager.default
+        var hosted = Set<String>(), hf = Set<String>()
+        if let owners = try? fm.contentsOfDirectory(atPath: splashModelsDir.path) {
+            for o in owners where !o.hasPrefix(".") {
+                let d = splashModelsDir.appendingPathComponent(o)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: d.path, isDirectory: &isDir), isDir.boolValue else { continue }
+                for n in (try? fm.contentsOfDirectory(atPath: d.path)) ?? [] where !n.hasPrefix(".") {
+                    hosted.insert("\(o)/\(n)")
+                }
+            }
+        }
+        if let entries = try? fm.contentsOfDirectory(atPath: hfHubDir.path) {
+            for e in entries where e.hasPrefix("models--") {
+                let body = e.dropFirst("models--".count)
+                guard let sep = body.range(of: "--") else { continue }
+                let o = String(body[body.startIndex..<sep.lowerBound])
+                let n = String(body[sep.upperBound...])
+                if !o.isEmpty && !n.isEmpty { hf.insert("\(o)/\(n)") }
+            }
+        }
+        print("hf cache: \(hfHubDir.path)")
+        print("models dir: \(splashModelsDir.path)")
+        print("App-managed: \(hosted.isEmpty ? "(none)" : hosted.sorted().joined(separator: " "))")
+        print("HF cache:    \(hf.isEmpty ? "(none)" : hf.sorted().joined(separator: " "))")
+        let app = AppDelegate()
+        app.cfg = Config.load()
+        print("menu lists:")
+        for m in app.installedModels() {
+            let mark = hosted.contains(m) ? "App" : (hf.contains(m) ? "HF " : "cfg")
+            print("  [\(mark)] \(m)")
+        }
     case "--engine-flags":
         // 调试验证用：看引擎到底认哪些 flag，以及当前配置里有没有被过滤掉的
         let known = Service.serveFlags().sorted()

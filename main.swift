@@ -158,6 +158,20 @@ private var splashModelsDir: URL {
     homeURL().appendingPathComponent("Library/Application Support/Splash/models")
 }
 
+/// mlx-serve 的模型库（`mlx-serve pull` 落到这里）。
+/// 本机已把它软链到 /Users/mrt/Models，所以扫这里等价于扫那个目录。
+private var mlxModelsDir: URL {
+    homeURL().appendingPathComponent(".mlx-serve/models")
+}
+
+/// 当前引擎的模型目录（Open models folder 用）
+private var engineModelsDir: URL {
+    switch activeEngine {
+    case .splash: return splashModelsDir
+    case .mlx:    return mlxModelsDir
+    }
+}
+
 /// Splash 真正把模型包落盘的地方（HF 缓存约定）。
 /// 顺序：HF_HUB_CACHE → $HF_HOME/hub → ~/.cache/huggingface/hub
 private var hfHubDir: URL {
@@ -1081,16 +1095,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return items
     }
 
+    /// 当前引擎选中的模型。两个引擎各存各的，所以读写都要按引擎分发。
+    private var currentModel: String {
+        switch activeEngine {
+        case .splash: return cfg.model
+        case .mlx:    return cfg.mlx.model
+        }
+    }
+
+    private func setCurrentModel(_ m: String) {
+        switch activeEngine {
+        case .splash: cfg.model = m
+        case .mlx:    cfg.mlx.model = m
+        }
+        cfg.save()
+    }
+
     private func modelItems() -> [NSMenuItem] {
         var items = installedModels().map { m -> NSMenuItem in
             let it = NSMenuItem(title: m, action: #selector(pickModel(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = m
-            it.state = (m == cfg.model) ? .on : .off
+            it.state = (m == currentModel) ? .on : .off
             return it
         }
         items.append(.separator())
-        let custom = NSMenuItem(title: "Custom owner/repo…", action: #selector(pickCustomModel), keyEquivalent: "")
+        let label = activeEngine == .mlx ? "Custom model (org/repo or path)…" : "Custom owner/repo…"
+        let custom = NSMenuItem(title: label, action: #selector(pickCustomModel), keyEquivalent: "")
         custom.target = self
         items.append(custom)
         return items
@@ -1163,7 +1194,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         refresh()
     }
 
+    /// 按引擎分发：能用引擎自己的 list 就用（口径和引擎一致），
+    /// 没有这个命令的（Splash 只有 serve/claude/opencode/codex/hermes）才退回扫目录。
     fileprivate func installedModels() -> [String] {
+        switch activeEngine {
+        case .splash: return splashInstalledModels()
+        case .mlx:    return mlxInstalledModels()
+        }
+    }
+
+    /// mlx-serve 自带 `list` 子命令，输出是 `NAME  TYPE  SIZE` 表格。
+    /// 命令失败（引擎没装 / 被换过）时退回扫 <models>/<org>/<repo>。
+    private func mlxInstalledModels() -> [String] {
+        let fm = FileManager.default
+        var out = Set<String>()
+
+        let r = run(engineBin, ["list"])
+        if r.status == 0 {
+            for line in r.out.split(separator: "\n") {
+                let s = line.trimmingCharacters(in: .whitespaces)
+                // 跳过表头、空行，以及引擎启动时那行 [mem] 调试输出
+                if s.isEmpty || s.hasPrefix("NAME") || s.hasPrefix("[") { continue }
+                // 首列就是 org/repo
+                guard let first = s.split(whereSeparator: { $0 == " " || $0 == "\t" }).first else { continue }
+                let name = String(first)
+                if name.contains("/") { out.insert(name) }
+            }
+        }
+
+        if out.isEmpty {
+            if let owners = try? fm.contentsOfDirectory(atPath: mlxModelsDir.path) {
+                for owner in owners where !owner.hasPrefix(".") {
+                    let dir = mlxModelsDir.appendingPathComponent(owner)
+                    var isDir: ObjCBool = false
+                    guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+                    if let names = try? fm.contentsOfDirectory(atPath: dir.path) {
+                        for name in names where !name.hasPrefix(".") { out.insert("\(owner)/\(name)") }
+                    }
+                }
+            }
+        }
+
+        var list = out.sorted()
+        // 当前配置里的模型即使扫不到也要留着，否则菜单会把它"弄丢"
+        if !cfg.mlx.model.isEmpty, !list.contains(cfg.mlx.model) { list.append(cfg.mlx.model) }
+        return list
+    }
+
+    private func splashInstalledModels() -> [String] {
         let fm = FileManager.default
         var out = Set<String>()
 
@@ -1300,14 +1378,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func pickModel(_ sender: NSMenuItem) {
         guard let m = sender.representedObject as? String else { return }
-        cfg.model = m; cfg.save(); askRestart("Model switched to \(m)")
+        setCurrentModel(m); askRestart("Model switched to \(m)")
     }
 
     @objc func pickCustomModel() {
-        guard let v = askString(title: "Custom model",
-                                message: "Hugging Face repository, in owner/repo form",
-                                defaultValue: cfg.model), !v.isEmpty else { return }
-        cfg.model = v; cfg.save(); askRestart("Model switched to \(v)")
+        let msg = activeEngine == .mlx
+            ? "Model directory path, or org/repo from the model library"
+            : "Hugging Face repository, in owner/repo form"
+        guard let v = askString(title: "Custom model", message: msg,
+                                defaultValue: currentModel), !v.isEmpty else { return }
+        setCurrentModel(v); askRestart("Model switched to \(v)")
     }
 
     @objc func pickValue(_ sender: NSMenuItem) {
@@ -1427,7 +1507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         NSWorkspace.shared.open(URL(fileURLWithPath: logErrPath))
     }
 
-    @objc func openModelDir()  { NSWorkspace.shared.open(splashModelsDir) }
+    @objc func openModelDir()  { NSWorkspace.shared.open(engineModelsDir) }
     @objc func openConfigDir() { NSWorkspace.shared.open(appSupportDir) }
 
     @objc func showAbout() {

@@ -1,4 +1,5 @@
-//  SplashBar — macOS 菜单栏常驻控制器，用于管理 Splash 推理服务的启动参数与启停。
+//  Splash-MLX — macOS 菜单栏常驻控制器，可择一管理 Splash 或 mlx-serve 推理引擎：
+//  选中哪个引擎，就显示哪个引擎的菜单，并把启停/参数作用于它。
 //  纯 AppKit 实现（无窗口、无 Dock 图标）。
 //  服务以独立会话（setsid）子进程方式拉起，菜单栏 App 退出后服务继续运行。
 //  登录自启通过 SMAppService 注册本 App 实现（不走 launchd，避开本机 bootstrap 被拒的问题）。
@@ -11,13 +12,94 @@ import ServiceManagement
 
 private let kSplashBin = "/opt/homebrew/bin/splash"
 
+/// 当前选中的推理引擎。和 activePort 一样是运行期状态：
+/// App 启动和 CLI 入口统一先 syncEngine(cfg.engine)，让下面所有静态方法
+/// （二进制路径 / 参数探测 / 健康检查端点）都作用于正确的引擎。
+enum Engine: String, Codable, CaseIterable {
+    case splash
+    case mlx
+
+    var displayName: String {
+        switch self {
+        case .splash: return "Splash"
+        case .mlx:    return "MLX Serve"
+        }
+    }
+
+    var defaultPort: String {
+        switch self {
+        case .splash: return "8000"
+        case .mlx:    return "11234"
+        }
+    }
+
+    /// 健康检查端点。Splash 是 `/status`，mlx-serve 是 `/health`。
+    var healthPath: String {
+        switch self {
+        case .splash: return "/status"
+        case .mlx:    return "/health"
+        }
+    }
+
+    /// 能力探测要跑的命令。Splash 的 serve 参数在 `serve --help` 里；
+    /// mlx-serve 的 flag 全在顶层 `--help` 里（`serve` 只是子命令）。
+    var helpArguments: [String] {
+        switch self {
+        case .splash: return ["serve", "--help"]
+        case .mlx:    return ["--help"]
+        }
+    }
+
+    /// 已安装版本查询的参数。两者都接受 --version，但输出格式不同：
+    /// Splash → "Splash 1.0.1"（取最后一个 token）；mlx-serve → 首行 "mlx-serve 26.9.5"（取第二个）。
+    var versionArguments: [String] { ["--version"] }
+}
+
+var activeEngine: Engine = .splash
+
+/// mlx-serve 是自解压安装的，没有 brew 的固定路径。
+/// 优先取真实二进制（软链也能跑，但直接指真身可避开 @executable_path 的任何歧义），
+/// 退回 ~/.local/bin 的软链，再退回 PATH 查找。
+private var kMlxBin: String {
+    let fm = FileManager.default
+    let home = homeURL().path
+    let candidates = [
+        home + "/.local/lib/mlx-serve/mlx-serve",
+        home + "/.local/bin/mlx-serve",
+        "/opt/homebrew/bin/mlx-serve",
+        "/usr/local/bin/mlx-serve",
+    ]
+    for c in candidates where fm.isExecutableFile(atPath: c) { return c }
+    return candidates[0]
+}
+
+/// 当前引擎的可执行文件
+var engineBin: String {
+    switch activeEngine {
+    case .splash: return kSplashBin
+    case .mlx:    return kMlxBin
+    }
+}
+
+func syncEngine(_ e: Engine) { activeEngine = e }
+
 // Splash 1.0.1 起支持 `--port`，可以有多个实例跑在不同端口上，
 // 所以端口不能再是编译期常量。App 启动和 CLI 入口统一先 syncPort(cfg.port)，
 // 让下面这些静态方法（lsof / curl / 拼 URL）探到正确的端口。
 var activePort: String = "8000"
 private var baseURL: String { "http://127.0.0.1:\(activePort)" }
 
-func syncPort(_ p: String) { activePort = p.isEmpty ? "8000" : p }
+func syncPort(_ p: String) { activePort = p.isEmpty ? activeEngine.defaultPort : p }
+
+/// 把配置里的「引擎 + 该引擎的端口」一起同步到运行期状态。
+/// **任何 Service 探测之前都必须调用** —— 否则会用错二进制、探错端口。
+func applyConfig(_ cfg: Config) {
+    syncEngine(cfg.engine)
+    switch cfg.engine {
+    case .splash: syncPort(cfg.port)
+    case .mlx:    syncPort(cfg.mlx.port)
+    }
+}
 
 // libproc 常量（直接给字面量，避免依赖 C 宏是否被 Swift 桥接）
 private let kProcPidTBSDInfo: Int32 = 3   // PROC_PIDTBSDINFO（实测返回 136 = sizeof(proc_bsdinfo)）
@@ -89,7 +171,95 @@ private var hfHubDir: URL {
 
 // MARK: - 配置
 
+/// mlx-serve 的专属设置。
+///
+/// 和 Splash 的参数几乎不重叠（MLX 有 --kv-quant / --prefix-cache-disk / --drafter，
+/// 没有 --max-cache-disk / --max-image-pixels 等），所以按"每引擎一套"分开存，
+/// 切引擎时各自带出上次的配置，互不干扰。
+struct MLXConfig: Codable {
+    /// 模型路径或 `org/repo`。留空 = 不传 --model，走按需加载整个模型库
+    var model: String = ""
+    var port: String = "11234"
+    /// 监听地址。留空用引擎默认（0.0.0.0）
+    var host: String = ""
+    var ctxSize: String = ""
+    /// KV 缓存量化：off / 4 / 8
+    var kvQuant: String = "off"
+    /// 前缀缓存落 SSD，如 "10GB"。留空=关闭
+    var prefixCacheDisk: String = ""
+    var maxResidentModels: String = ""
+    var idleEvictSecs: String = ""
+    var noVision: Bool = false
+    var metrics: Bool = false
+    var apiKey: String = ""
+    /// Prompt Lookup Decoding（引擎默认开）
+    var enablePLD: Bool = true
+    var noMTP: Bool = false
+    /// --drafter：Gemma 4 assistant 或 DFlash block-drafter 的目录
+    var drafter: String = ""
+
+    init() {}
+
+    /// 同 Config：任一字段缺失都退回默认，不整体丢弃
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model             = (try? c.decode(String.self, forKey: .model)) ?? model
+        port              = (try? c.decode(String.self, forKey: .port)) ?? port
+        host              = (try? c.decode(String.self, forKey: .host)) ?? host
+        ctxSize           = (try? c.decode(String.self, forKey: .ctxSize)) ?? ctxSize
+        kvQuant           = (try? c.decode(String.self, forKey: .kvQuant)) ?? kvQuant
+        prefixCacheDisk   = (try? c.decode(String.self, forKey: .prefixCacheDisk)) ?? prefixCacheDisk
+        maxResidentModels = (try? c.decode(String.self, forKey: .maxResidentModels)) ?? maxResidentModels
+        idleEvictSecs     = (try? c.decode(String.self, forKey: .idleEvictSecs)) ?? idleEvictSecs
+        noVision          = (try? c.decode(Bool.self, forKey: .noVision)) ?? noVision
+        metrics           = (try? c.decode(Bool.self, forKey: .metrics)) ?? metrics
+        apiKey            = (try? c.decode(String.self, forKey: .apiKey)) ?? apiKey
+        enablePLD         = (try? c.decode(Bool.self, forKey: .enablePLD)) ?? enablePLD
+        noMTP             = (try? c.decode(Bool.self, forKey: .noMTP)) ?? noMTP
+        drafter           = (try? c.decode(String.self, forKey: .drafter)) ?? drafter
+    }
+
+    /// 拼出 mlx-serve 的启动参数。
+    /// 和 Splash 一样：**每个可选 flag 都先问引擎认不认识**，
+    /// 传了不认识的选项会 argparse 直接退出、服务起不来。
+    /// 模型为空时用 `serve` 子命令（按需加载整个库），否则用 `--serve` 标志形式。
+    var serveArguments: [String] {
+        var a: [String] = []
+        if model.isEmpty {
+            a = ["serve"]
+        } else {
+            a = ["--model", model, "--serve"]
+        }
+        if !port.isEmpty, port != Engine.mlx.defaultPort, Service.flagAvailable("--port") {
+            a += ["--port", port]
+        }
+        if !host.isEmpty, Service.flagAvailable("--host") { a += ["--host", host] }
+        if !ctxSize.isEmpty, Service.flagAvailable("--ctx-size") { a += ["--ctx-size", ctxSize] }
+        if kvQuant != "off", Service.flagAvailable("--kv-quant") { a += ["--kv-quant", kvQuant] }
+        if !prefixCacheDisk.isEmpty, Service.flagAvailable("--prefix-cache-disk") {
+            a += ["--prefix-cache-disk", prefixCacheDisk]
+        }
+        if !maxResidentModels.isEmpty, Service.flagAvailable("--max-resident-models") {
+            a += ["--max-resident-models", maxResidentModels]
+        }
+        if !idleEvictSecs.isEmpty, Service.flagAvailable("--idle-evict-secs") {
+            a += ["--idle-evict-secs", idleEvictSecs]
+        }
+        if !drafter.isEmpty, Service.flagAvailable("--drafter") { a += ["--drafter", drafter] }
+        if noVision, Service.flagAvailable("--no-vision") { a += ["--no-vision"] }
+        if metrics, Service.flagAvailable("--metrics") { a += ["--metrics"] }
+        if !enablePLD, Service.flagAvailable("--no-pld") { a += ["--no-pld"] }
+        if noMTP, Service.flagAvailable("--no-mtp") { a += ["--no-mtp"] }
+        if !apiKey.isEmpty, Service.flagAvailable("--api-key") { a += ["--api-key", apiKey] }
+        return a
+    }
+}
+
 final class Config: Codable {
+    /// 当前选中的引擎。两套配置各自独立保存，切换时带出各自的设置
+    var engine: Engine = .splash
+    /// mlx-serve 的专属设置（engine == .mlx 时生效）
+    var mlx = MLXConfig()
     var model: String = "incoai/Qwen3.8-27B-Splash"
     var maxMemory: String = "auto"
     var maxContext: String = "auto"
@@ -116,6 +286,9 @@ final class Config: Codable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // 引擎选择：老配置文件没有这个字段，退回 splash（保持既有行为不变）
+        engine            = (try? c.decode(Engine.self, forKey: .engine)) ?? engine
+        mlx               = (try? c.decode(MLXConfig.self, forKey: .mlx)) ?? mlx
         model             = (try? c.decode(String.self, forKey: .model)) ?? model
         maxMemory         = (try? c.decode(String.self, forKey: .maxMemory)) ?? maxMemory
         maxContext        = (try? c.decode(String.self, forKey: .maxContext)) ?? maxContext
@@ -158,6 +331,13 @@ final class Config: Codable {
     /// 探测失败时 `flagAvailable` 返回 true（fail open），参数照旧传 —— 不能因为问不到引擎
     /// 就把用户存好的配置悄悄丢掉。
     var serveArguments: [String] {
+        switch engine {
+        case .splash: return splashServeArguments
+        case .mlx:    return mlx.serveArguments
+        }
+    }
+
+    private var splashServeArguments: [String] {
         var a = ["serve", "--model", model]
         if Service.flagAvailable("--max-memory")  { a += ["--max-memory", maxMemory] }
         if Service.flagAvailable("--max-context") { a += ["--max-context", maxContext] }
@@ -355,11 +535,26 @@ enum Service {
         invalidateCachesIfEngineChanged()
         if installedQueried { return installedCache }
         installedQueried = true
-        let r = run(kSplashBin, ["--version"])
+        let r = run(engineBin, activeEngine.versionArguments)
         let raw = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
-        if r.status == 0, let last = raw.split(separator: " ").last,
-           last.contains(where: \.isNumber) {
-            installedCache = String(last)
+        if r.status == 0 {
+            switch activeEngine {
+            case .splash:
+                // "Splash 1.0.1" → 取最后一个 token
+                if let last = raw.split(separator: " ").last, last.contains(where: \.isNumber) {
+                    installedCache = String(last)
+                }
+            case .mlx:
+                // 输出是多行：先有一行 `[mem] …` 调试行，然后是 `mlx-serve 26.9.5`、
+                // `mlx 0.32.2`… 直接取"最后一个 token"会拿到 `ds4 unknown` 里的 unknown，
+                // 所以定位以 "mlx-serve" 开头的那一行，取第二个 token。
+                for line in raw.split(separator: "\n") {
+                    let t = line.split(separator: " ")
+                    if t.first == "mlx-serve", t.count >= 2 {
+                        installedCache = String(t[1]); break
+                    }
+                }
+            }
         }
         return installedCache
     }
@@ -371,8 +566,9 @@ enum Service {
     /// 所以每次建菜单都能安全调用。附上解析后二进制的 mtime，
     /// 兜住"同版本原地重装"这种链接目标不变的情况。
     private static func engineFingerprint() -> String {
-        let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: kSplashBin)) ?? kSplashBin
-        let resolved = URL(fileURLWithPath: kSplashBin).resolvingSymlinksInPath().path
+        let bin = engineBin
+        let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: bin)) ?? bin
+        let resolved = URL(fileURLWithPath: bin).resolvingSymlinksInPath().path
         let attrs = try? FileManager.default.attributesOfItem(atPath: resolved)
         let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         return "\(link)|\(resolved)|\(Int(mtime))"
@@ -400,7 +596,7 @@ enum Service {
     static func serveFlags() -> Set<String> {
         invalidateCachesIfEngineChanged()
         if let c = serveFlagsCache { return c }
-        let r = run(kSplashBin, ["serve", "--help"])
+        let r = run(engineBin, activeEngine.helpArguments)
         let text = r.out + r.err
         var flags: Set<String> = []
         var i = text.startIndex
@@ -442,9 +638,11 @@ enum Service {
 
         var env = ["PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                    "HOME": homeURL().path]
-        if !cfg.apiKey.isEmpty { env["SPLASH_API_KEY"] = cfg.apiKey }
+        // Splash 的 `--api-key` 默认值就是 SPLASH_API_KEY 环境变量，所以用环境变量注入；
+        // mlx-serve 没有对应环境变量，走 --api-key 标志（已拼进 serveArguments）。
+        if activeEngine == .splash, !cfg.apiKey.isEmpty { env["SPLASH_API_KEY"] = cfg.apiKey }
 
-        let argv = [kSplashBin] + cfg.serveArguments
+        let argv = [engineBin] + cfg.serveArguments
         guard let pid = spawnDetached(argv, env: env) else {
             return "start failed: posix_spawn returned \(errno)"
         }
@@ -484,7 +682,15 @@ enum Service {
         var s = Status()
         if paused { return s }
         let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
-                                      baseURL + "/status"])
+                                      baseURL + activeEngine.healthPath])
+        // mlx-serve 的 /health 返回的是纯文本（不是 JSON），所以不能要求解析成字典：
+        // 只要 curl 成功且响应非空就算活着，下面的 Splash 专属字段自然为空。
+        if activeEngine == .mlx {
+            if r.status == 0, !r.out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                s.up = true
+            }
+            return s
+        }
         guard r.status == 0,
               let data = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -563,7 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        syncPort(cfg.port)          // 必须在任何 Service 探测之前，否则会探到默认端口
+        applyConfig(cfg)          // 必须在任何 Service 探测之前，否则会探到默认端口
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -630,7 +836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // ── 状态区：压到 4 行以内（原来是 7 行）
         let runVer = Service.runningVersion()
         let instVer = Service.installedVersion()
-        menu.addItem(disabled("Splash \(runVer ?? instVer ?? "?")  ·  \(stateLabel())"))
+        menu.addItem(disabled("\(activeEngine.displayName) \(runVer ?? instVer ?? "?")  ·  \(stateLabel())"))
         if running {
             menu.addItem(disabled(String(format: "%.1f tok/s · accept %.1f%% · memory %.1f GB",
                                          st.tps, st.accept * 100, st.residentGB)))
@@ -645,6 +851,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if external { menu.addItem(disabled("⚠️ port held by an external process, not managed by SplashBar")) }
         if starting { menu.addItem(disabled("⏳ loading model…")) }
         menu.addItem(.separator())
+
+        // ── 引擎选择：决定下面整组菜单属于哪个引擎。
+        // 两个引擎是互斥的（一次只跑一个），切换时若当前引擎在跑会先停掉。
+        menu.addItem(submenuItem("Engine  ·  \(activeEngine.displayName)", items: engineItems()))
 
         // 启动：运行中 / 端口被占用时置灰；暂停时充当"继续"
         let startItem = NSMenuItem(title: isPaused ? "▶  Resume" : "▶  Start",
@@ -929,6 +1139,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// 只看 (1) 会漏掉"已下载装配、但还没被服务过"的包，那样新下的模型在菜单里根本不出现，
     /// 只能靠 "Custom owner/repo…" 手打全名 —— 而用户刚下完一个包时最想看到的
     /// 恰恰是它能直接选。
+    // MARK: 引擎切换
+
+    private func engineItems() -> [NSMenuItem] {
+        Engine.allCases.map { e in
+            let it = NSMenuItem(title: e.displayName, action: #selector(pickEngine(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = e.rawValue
+            it.state = (e == activeEngine) ? .on : .off
+            return it
+        }
+    }
+
+    /// 切换到另一个引擎。**互斥**：当前引擎在跑就先停掉，再换配置并重建菜单。
+    /// 不停直接切会留下"菜单显示 MLX、实际还占着 8000 端口跑 Splash"的错乱状态。
+    @objc func pickEngine(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let e = Engine(rawValue: raw), e != cfg.engine else { return }
+        if Service.managed || Service.status().up { _ = Service.stop() }
+        cfg.engine = e
+        cfg.save()
+        applyConfig(cfg)
+        refresh()
+    }
+
     fileprivate func installedModels() -> [String] {
         let fm = FileManager.default
         var out = Set<String>()
@@ -1088,7 +1322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         default: return
         }
         cfg.save()
-        syncPort(cfg.port)          // 端口一改，探测用的 activePort 必须立刻跟上
+        applyConfig(cfg)          // 端口一改，探测用的 activePort 必须立刻跟上
         askRestart("Setting updated: \(v.isEmpty ? "default" : v)")
     }
 
@@ -1115,7 +1349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         default: return
         }
         cfg.save()
-        syncPort(cfg.port)
+        applyConfig(cfg)
         askRestart("Setting updated: \(v)")
     }
 
@@ -1322,7 +1556,7 @@ func runCLI(_ argv: [String]) -> Bool {
     }
 
     let cfg = Config.load()
-    syncPort(cfg.port)              // 同上：CLI 也要先同步端口再探测
+    applyConfig(cfg)              // 同上：CLI 也要先同步端口再探测
     switch cmd {
     case "--status":
         let s = Service.status()

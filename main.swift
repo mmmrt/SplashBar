@@ -850,7 +850,9 @@ enum Service {
     /// 只能拿相邻两次采样求差。这是唯一需要跨调用保存的状态。
     /// 上一次采样的 (输出 token 累计, 实际解码耗时累计)。
     /// 用**解码耗时**而不是墙上时间做分母 —— 详见 status() 里的说明。
-    private static var lastMLXSample: (t: Date, tokens: Double, decodeSeconds: Double)?
+    /// 上一次采样的 (输出token累计, 解码耗时累计, 实时token累计)。
+    /// 两个 token 来源各有盲区，需要同时跟踪：见 status() 里的说明。
+    private static var lastMLXSample: (t: Date, outTokens: Double, decodeSeconds: Double, live: Double)?
     /// 最近一次真正测到的非零速率。窗口一旦没撞上生成就会返回 0，
     /// 靠它把上一个真实值留住，并在菜单里标出"多久之前测的"。
     private static var lastMLXRate: (value: Double, at: Date)?
@@ -896,27 +898,43 @@ enum Service {
                 s.ttftP50 = sum / cnt * 1000.0
             }
             // 实时解码速度 = Δ(累计生成 token) / Δ(真实经过时间)
-            // 速率 = Δ(输出 token) / Δ(**实际解码耗时**)。
+            // 速率来源用 gauges.generation_tokens_live，**不要用直方图**。
             //
-            // 不用墙上时间做大分母：一次生成可能只跑 0.35 秒、却落在 5 秒的轮询窗口里，
-            // 那样算出来会被摊薄约 5 倍（实测真实 174 tok/s 会被显示成 116）。
-            // decode_time_seconds 只在真正解码时累加，所以比值就是真实解码速率。
-            if let h = obj["histograms"] as? [String: Any],
-               let otH = h["output_tokens"] as? [String: Any],
-               let dtH = h["decode_time_seconds"] as? [String: Any],
-               let otSum = num(otH["sum"]), let dtSum = num(dtH["sum"]) {
+            // 踩过的坑：histograms.output_tokens.sum 只在**请求完成时**才累加 ——
+            // 实测长生成期间它纹丝不动（3379 → 3379 → 3379），直到请求结束才跳到 4279。
+            // 而 WorkBuddy 的 agent 生成动辄几十秒，于是整个生成过程都算不出速率，
+            // 菜单一直显示 idle（用户看到的正是这个）。
+            //
+            // generation_tokens_live 是**包含进行中请求**的实时累计量
+            // （实测生成中持续增长：3403 → 3761 → 4118）。
+            // 生成是连续的、会铺满整个轮询窗口，所以这里用墙上时间做分母不会被摊薄
+            // —— 被摊薄的是"短请求落在长窗口里"那种情况，长生成不适用。
+            let hh = (obj["histograms"] as? [String: Any]) ?? [:]
+            let outSum = num((hh["output_tokens"] as? [String: Any])?["sum"]) ?? 0
+            let decSum = num((hh["decode_time_seconds"] as? [String: Any])?["sum"]) ?? 0
+            if let live = num(g["generation_tokens_live"]) {
                 let now = Date()
                 if let prev = lastMLXSample {
-                    let dTok = otSum - prev.tokens
-                    let dDec = dtSum - prev.decodeSeconds
-                    if dTok > 0, dDec > 0.05 {
-                        let rate = dTok / dDec
-                        lastMLXRate = (rate, now)
-                        s.tps = rate
+                    var rate: Double?
+                    let dOut = outSum - prev.outTokens
+                    let dDec = decSum - prev.decodeSeconds
+                    if dOut > 0, dDec > 0.05 {
+                        // ① 直方图：窗口内有请求**完成**时最精确（分母是真实解码耗时，不摊薄）
+                        rate = dOut / dDec
+                    } else {
+                        // ② 实时累计量：长生成期间直方图一动不动，只有它可靠。
+                        //    这种场景生成是连续的、铺满整个窗口，所以墙上时间做分母不会被摊薄。
+                        let dLive = live - prev.live
+                        let dt = now.timeIntervalSince(prev.t)
+                        if dLive > 0, dt >= 0.5 { rate = dLive / dt }
                     }
-                    lastMLXSample = (now, otSum, dtSum)
+                    if let r = rate, r > 0 {
+                        lastMLXRate = (r, now)
+                        s.tps = r
+                    }
+                    lastMLXSample = (now, outSum, decSum, live)
                 } else {
-                    lastMLXSample = (now, otSum, dtSum)   // 第一次采样只记录基线
+                    lastMLXSample = (now, outSum, decSum, live)   // 第一次采样只记录基线
                 }
                 // 本窗口没生成（绝大多数窗口都如此）：沿用上次实测值并标出年龄，
                 // 超过 kMLXRateMaxAge 才当真空闲。否则菜单几乎永远显示 0，
@@ -2034,7 +2052,7 @@ func runCLI(_ argv: [String]) -> Bool {
     switch cmd {
     case "--start", "--stop", "--restart", "--status", "--states", "--takeover",
          "--pause", "--resume", "--login-on", "--login-off", "--dump-menu", "--version-of",
-         "--engine-flags", "--models":
+         "--engine-flags", "--models", "--rate":
         break
     case "--help", "-h":
         print("""
@@ -2215,6 +2233,25 @@ func runCLI(_ argv: [String]) -> Bool {
                 print("  [\(mark)] \(m)")
             }
         }
+    case "--rate":
+        // 调试验证用：在**单个进程**里跑真实的 status() 轮询，并同时发一次生成，
+        // 打印每次算出的 tps。菜单栏的速率逻辑必须跨调用才有基线，
+        // 单次 --status 永远测不出来（那是新进程、没有 lastMLXSample）。
+        print("polling Service.status() while a generation runs…")
+        DispatchQueue.global().async {
+            let body = #"{"model":"Qwen3.6-35B-A3B-MLX-Serve-4bit","messages":[{"role":"user","content":"Count from 1 to 40."}],"max_tokens":60}"#
+            _ = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "120",
+                                      "-X", "POST", "-H", "Content-Type: application/json",
+                                      "-d", body, baseURL + "/v1/chat/completions"])
+        }
+        for i in 0..<10 {
+            let s = Service.status()
+            print(String(format: "  t=%2ds  metrics=%@  tps=%6.1f  stale=%3.0f  state=%@",
+                         i * 2, s.metricsAvailable ? "yes" : "no", s.tps, s.tpsStaleSeconds,
+                         s.up ? "up" : "down"))
+            Thread.sleep(forTimeInterval: 2)
+        }
+        return true
     case "--engine-flags":
         // 调试验证用：看引擎到底认哪些 flag，以及当前配置里有没有被过滤掉的
         let known = Service.serveFlags().sorted()

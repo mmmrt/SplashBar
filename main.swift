@@ -1215,6 +1215,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return items
     }
 
+    /// 布尔开关的子菜单项：就两项，带勾选状态，**不追加 Custom…**。
+    /// 不能复用 choiceItems —— 它一定会加一个 free-text 输入项，
+    /// 对"开/关"这种二值设置来说是个没有意义的入口。
+    private func boolItems(on: Bool, onLabel: String, offLabel: String, tag: Int) -> [NSMenuItem] {
+        let a = NSMenuItem(title: onLabel, action: #selector(pickValue(_:)), keyEquivalent: "")
+        a.target = self; a.tag = tag; a.representedObject = "on"; a.state = on ? .on : .off
+        let b = NSMenuItem(title: offLabel, action: #selector(pickValue(_:)), keyEquivalent: "")
+        b.target = self; b.tag = tag; b.representedObject = "off"; b.state = on ? .off : .on
+        return [a, b]
+    }
+
     /// mlx-serve 的参数菜单。字段全部来自 `MLXConfig`（与 Splash 那套完全隔离），
     /// 每一项都过 `gatedSubmenu` —— 引擎 `--help` 里没有该 flag 就整组置灰。
     private func mlxSettingsItems() -> [NSMenuItem] {
@@ -1267,17 +1278,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             options: [("", "Auto (use the checkpoint's own)")],
             customLabel: "Custom… (drafter folder)", tag: kTagMlxDrafter)))
 
-        items.append(gatedSubmenu("Vision  --no-vision", tag: kTagMlxVision, items: choiceItems(
-            current: cfg.mlx.noVision ? "off" : "on",
-            options: [("on", "Load the vision encoder"),
-                      ("off", "Skip it (saves memory)")],
-            customLabel: "Custom…", tag: kTagMlxVision)))
+        items.append(gatedSubmenu("Vision  --no-vision", tag: kTagMlxVision, items: boolItems(
+            on: !cfg.mlx.noVision,
+            onLabel: "Load the vision encoder",
+            offLabel: "Skip it --no-vision (saves memory)",
+            tag: kTagMlxVision)))
 
-        items.append(gatedSubmenu("Metrics  --metrics", tag: kTagMlxMetrics, items: choiceItems(
-            current: cfg.mlx.metrics ? "on" : "off",
-            options: [("off", "Off (default)"),
-                      ("on", "Prometheus /metrics + index panel")],
-            customLabel: "Custom…", tag: kTagMlxMetrics)))
+        items.append(gatedSubmenu("Metrics  --metrics", tag: kTagMlxMetrics, items: boolItems(
+            on: cfg.mlx.metrics,
+            onLabel: "On — Prometheus /metrics + index panel",
+            offLabel: "Off (default)",
+            tag: kTagMlxMetrics)))
 
         items.append(.separator())
         items.append(submenuItem("Model folder…", items: modelDirItems()))
@@ -1976,9 +1987,19 @@ func runCLI(_ argv: [String]) -> Bool {
         let app = AppDelegate()
         app.cfg = Config.load()
         print("menu lists:")
-        for m in app.installedModels() {
-            let mark = hosted.contains(m) ? "App" : (hf.contains(m) ? "HF " : "cfg")
-            print("  [\(mark)] \(m)")
+        if activeEngine == .mlx {
+            // MLX 的清单来自 `mlx-serve list`，拿 Splash 的 App/HF 目录去比对毫无意义
+            // （那样每一条都会被标成 cfg）。这里改成区分"库里的"和"配置里手填的"。
+            print("  (source: `mlx-serve list`，失败时退回扫模型目录)")
+            let configured = app.cfg.mlx.model
+            for m in app.installedModels() {
+                print("  [\(m == configured ? "cfg " : "list")] \(m)")
+            }
+        } else {
+            for m in app.installedModels() {
+                let mark = hosted.contains(m) ? "App" : (hf.contains(m) ? "HF " : "cfg")
+                print("  [\(mark)] \(m)")
+            }
         }
     case "--engine-flags":
         // 调试验证用：看引擎到底认哪些 flag，以及当前配置里有没有被过滤掉的
@@ -1988,7 +2009,8 @@ func runCLI(_ argv: [String]) -> Bool {
         print("flags:   \(known.isEmpty ? "(none)" : known.joined(separator: " "))")
         // 逐项列出受门控的参数 —— 范围与顺序都取自 kGatedParams，
         // 也就是菜单置灰 / serveArguments 过滤的同一张表
-        for p in kGatedParams {
+        // 用当前引擎自己的那张门控表，否则 MLX 下会去查一堆 Splash 专属 flag
+        for p in (activeEngine == .mlx ? kMlxGatedParams : kGatedParams) {
             print("  \(Service.flagAvailable(p.flag) ? "✅" : "❌") \(p.flag)")
         }
         print("args:    \(cfg.serveArguments.joined(separator: " "))")

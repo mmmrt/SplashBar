@@ -267,8 +267,13 @@ struct MLXConfig: Codable {
     /// 模型路径或 `org/repo`。留空 = 不传 --model，走按需加载整个模型库
     var model: String = ""
     var port: String = "11234"
-    /// 监听地址。留空用引擎默认（0.0.0.0）
-    var host: String = ""
+    /// 监听地址。默认只绑本机。
+    ///
+    /// **不能用引擎默认值**：mlx-serve 的默认是 `0.0.0.0`，它自己的启动日志就会警告
+    /// "reachable by every device on the network this Mac is on"。Splash 那边默认是
+    /// 127.0.0.1，两个引擎必须一致 —— 否则一换引擎，服务就悄悄暴露到局域网上去了。
+    /// 想局域网共享就显式选 0.0.0.0（此时务必同时设 API Key）。
+    var host: String = "127.0.0.1"
     var ctxSize: String = ""
     /// KV 缓存量化：off / 4 / 8
     var kvQuant: String = "off"
@@ -296,7 +301,10 @@ struct MLXConfig: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         model             = (try? c.decode(String.self, forKey: .model)) ?? model
         port              = (try? c.decode(String.self, forKey: .port)) ?? port
-        host              = (try? c.decode(String.self, forKey: .host)) ?? host
+        // 空串是早期版本留下的"用引擎默认"，那等于 0.0.0.0 —— 迁移成只绑本机。
+        // 光改字段默认值救不了已有配置（它们存的是显式的空串）。
+        let rawHost = (try? c.decode(String.self, forKey: .host)) ?? host
+        host = rawHost.isEmpty ? "127.0.0.1" : rawHost
         ctxSize           = (try? c.decode(String.self, forKey: .ctxSize)) ?? ctxSize
         kvQuant           = (try? c.decode(String.self, forKey: .kvQuant)) ?? kvQuant
         prefixCacheDisk   = (try? c.decode(String.self, forKey: .prefixCacheDisk)) ?? prefixCacheDisk
@@ -1330,9 +1338,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         items.append(gatedSubmenu("Bind address  --host", tag: kTagMlxHost, items: choiceItems(
             current: cfg.mlx.host,
-            options: [("", "Engine default (0.0.0.0)"),
-                      ("127.0.0.1", "127.0.0.1 (loopback only)"),
-                      ("0.0.0.0", "0.0.0.0 (all interfaces)")],
+            // 安全的放最前，并说明 0.0.0.0 的代价 —— 别让人顺手就把它暴露出去
+            options: [("127.0.0.1", "127.0.0.1 — this Mac only (default)"),
+                      ("0.0.0.0", "0.0.0.0 — every device on your network"),
+                      ("", "Engine default (0.0.0.0 — not recommended)")],
             customLabel: "Custom… (e.g. 192.168.1.5)", tag: kTagMlxHost)))
 
         items.append(gatedSubmenu("Context  --ctx-size", tag: kTagMlxCtx, items: choiceItems(

@@ -858,6 +858,11 @@ enum Service {
     private static var lastMLXRate: (value: Double, at: Date)?
     /// 超过这个年龄就不再显示速率（说明确实空闲了）
     private static let kMLXRateMaxAge: Double = 30
+    /// live 计数的历史采样（约 6 秒窗口）。
+    /// `generation_tokens_live` 的更新粒度约 1.6 秒 —— 用 1 秒轮询窗口算差值，
+    /// 会一会儿是 0、一会儿一次吞掉一整批（实测显示 273、367，而真实只有 184）。
+    /// 所以拿 ~2.5 秒前的采样做基线，跨过它的更新粒度，得到平滑且准确的速率。
+    private static var mlxLiveHistory: [(t: Date, v: Double)] = []
 
     /// 状态探测。已暂停（进程冻结）时直接短路，避免每次轮询都等 curl 超时。
     static func status() -> Status {
@@ -921,12 +926,21 @@ enum Service {
                     if dOut > 0, dDec > 0.05 {
                         // ① 直方图：窗口内有请求**完成**时最精确（分母是真实解码耗时，不摊薄）
                         rate = dOut / dDec
-                    } else {
+                    } else if s.reqRunning > 0 {
                         // ② 实时累计量：长生成期间直方图一动不动，只有它可靠。
-                        //    这种场景生成是连续的、铺满整个窗口，所以墙上时间做分母不会被摊薄。
-                        let dLive = live - prev.live
-                        let dt = now.timeIntervalSince(prev.t)
-                        if dLive > 0, dt >= 0.5 { rate = dLive / dt }
+                        //
+                        // 必须用 requests_running 把这条路径限制在"确实有请求在跑"时：
+                        // 生成结束后 live 计数就不动了，再拿它算差值会得到一路衰减的假值
+                        // （实测 123 → 48 → …），而这时正确的做法是保留上一个准确值。
+                        //    基线要往前取 ~2.5 秒 —— 它的更新粒度约 1.6 秒，
+                        //    用 1 秒窗口会一次吞掉一整批，算出来虚高（实测 367 vs 真实 184）。
+                        mlxLiveHistory.append((now, live))
+                        mlxLiveHistory.removeAll { now.timeIntervalSince($0.t) > 6 }
+                        if let base = mlxLiveHistory.first(where: { now.timeIntervalSince($0.t) >= 2.5 }) {
+                            let dLive = live - base.v
+                            let dt = now.timeIntervalSince(base.t)
+                            if dLive > 0, dt > 0 { rate = dLive / dt }
+                        }
                     }
                     if let r = rate, r > 0 {
                         lastMLXRate = (r, now)
@@ -949,6 +963,7 @@ enum Service {
             }
             return s
         }
+        mlxLiveHistory.removeAll()
         lastMLXSample = nil   // 换回 Splash 时清掉，避免下次切回来算出离谱的差值
         guard r.status == 0,
               let data = r.out.data(using: .utf8),
@@ -1021,6 +1036,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     var statusItem: NSStatusItem!
     var cfg = Config.load()
     var st = Status()
+    /// 模型清单缓存（见 installedModels）
+    private var modelListCache: (at: Date, list: [String])?
     var timer: Timer?
     var starting = false
 
@@ -1048,7 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             rebuildMenu()
         }
 
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         RunLoop.main.add(timer!, forMode: .common)
@@ -1394,6 +1411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case .mlx:    cfg.mlx.model = m
         }
         cfg.save()
+        invalidateModelList()
     }
 
     private func modelItems() -> [NSMenuItem] {
@@ -1535,12 +1553,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         panel.prompt = "Use this folder"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         if activeEngine == .mlx { cfg.mlx.modelDir = url.path } else { cfg.modelDirSplash = url.path }
-        cfg.save(); applyConfig(cfg); refresh()
+        cfg.save(); applyConfig(cfg); invalidateModelList(); refresh()
     }
 
     @objc func clearModelDir() {
         if activeEngine == .mlx { cfg.mlx.modelDir = "" } else { cfg.modelDirSplash = "" }
-        cfg.save(); applyConfig(cfg); refresh()
+        cfg.save(); applyConfig(cfg); invalidateModelList(); refresh()
     }
 
     private func apiKeyItems() -> [NSMenuItem] {
@@ -1607,17 +1625,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         cfg.engine = e
         cfg.save()
         applyConfig(cfg)
+        invalidateModelList()
         refresh()
     }
 
     /// 按引擎分发：能用引擎自己的 list 就用（口径和引擎一致），
     /// 没有这个命令的（Splash 只有 serve/claude/opencode/codex/hermes）才退回扫目录。
     fileprivate func installedModels() -> [String] {
-        switch activeEngine {
-        case .splash: return splashInstalledModels()
-        case .mlx:    return mlxInstalledModels()
-        }
+        // 菜单每次重建都会走到这里，而 MLX 分支要跑 `mlx-serve list`（一个进程）。
+        // 刷新频率提到 1 秒后，每秒起一个进程就太浪费了 —— 模型库很少变，缓存 60 秒。
+        // 换引擎 / 换模型 / 换模型目录时会主动失效（见 invalidateModelList）。
+        if let c = modelListCache, Date().timeIntervalSince(c.at) < 60 { return c.list }
+        let list = (activeEngine == .mlx) ? mlxInstalledModels() : splashInstalledModels()
+        modelListCache = (Date(), list)
+        return list
     }
+
+    private func invalidateModelList() { modelListCache = nil }
 
     /// mlx-serve 自带 `list` 子命令，输出是 `NAME  TYPE  SIZE` 表格。
     /// 命令失败（引擎没装 / 被换过）时退回扫 <models>/<org>/<repo>。

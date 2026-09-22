@@ -429,6 +429,8 @@ final class Config: Codable {
     var autoStartOnLaunch: Bool = false
     /// 菜单栏图标右侧是否显示模型名
     var showModelName: Bool = true
+    /// 菜单栏是否显示实时速度（只在有速率时出现，空闲时自动消失）
+    var showSpeed: Bool = true
 
     /// 手写解码：任一字段缺失（老版本配置文件）都退回默认值，不整体丢弃配置
     init() {}
@@ -452,6 +454,7 @@ final class Config: Codable {
         loginItem         = (try? c.decode(Bool.self, forKey: .loginItem)) ?? loginItem
         autoStartOnLaunch = (try? c.decode(Bool.self, forKey: .autoStartOnLaunch)) ?? autoStartOnLaunch
         showModelName     = (try? c.decode(Bool.self, forKey: .showModelName)) ?? showModelName
+        showSpeed         = (try? c.decode(Bool.self, forKey: .showSpeed)) ?? showSpeed
     }
 
     static func load() -> Config {
@@ -1257,13 +1260,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         showName.target = self
         showName.state = cfg.showModelName ? .on : .off
 
+        let showSpeed = NSMenuItem(title: "Show speed in menu bar", action: #selector(toggleShowSpeed), keyEquivalent: "")
+        showSpeed.target = self
+        showSpeed.state = cfg.showSpeed ? .on : .off
+
         let login = NSMenuItem(title: "Start at login", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.target = self
         login.state = cfg.loginItem ? .on : .off
 
         let about = NSMenuItem(title: "About Splash-MLX", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
-        menu.addItem(submenuItem("Preferences & About", items: [showName, login, .separator(), about]))
+        menu.addItem(submenuItem("Preferences & About", items: [showName, showSpeed, login, .separator(), about]))
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit Splash-MLX (stops the service)",
@@ -1311,8 +1318,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private func applyStatusButton() {
         guard let button = statusItem.button else { return }
         button.image = menuBarIcon()
-        button.imagePosition = cfg.showModelName ? .imageLeading : .imageOnly
-        button.title = cfg.showModelName ? " " + modelShortName() : ""
+        // 速度只在"有值"时出现（生成中 + 结束后约 30 秒），空闲时这一块消失，
+        // 所以菜单栏是**间歇性变宽**，而不是常驻变宽。
+        var text = ""
+        if cfg.showModelName { text += " " + modelShortName() }
+        if cfg.showSpeed, st.tps > 0 { text += String(format: " %.0f t/s", st.tps) }
+
+        button.imagePosition = text.isEmpty ? .imageOnly : .imageLeading
+        // 等宽数字：比例字体下 "174" 和 "99" 宽度不同，每秒变一次会让整个图标左右跳。
+        // 11pt 也比菜单栏默认字号小一点，配合 "t/s" 的缩写控制占宽。
+        button.attributedTitle = text.isEmpty
+            ? NSAttributedString(string: "")
+            : NSAttributedString(string: text, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)])
         button.toolTip = "Splash-MLX — \(cfg.model)"
     }
 
@@ -1822,6 +1840,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         cfg.showModelName.toggle()
         cfg.save()
         applyStatusButton()
+    }
+
+    @objc func toggleShowSpeed() {
+        cfg.showSpeed.toggle(); cfg.save(); applyStatusButton()
     }
 
     @objc func stopService() {

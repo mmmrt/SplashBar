@@ -524,6 +524,23 @@ struct Status {
     var memoryPressure = ""
     var residentGB = 0.0
     var deviceName = ""
+
+    // ── mlx-serve 侧多出来的指标（Splash 没有对应项，那边保持默认 0）
+    /// /metrics.json 是否拿到了数据。
+    /// **服务活着 ≠ 有指标**：mlx-serve 的 metrics 要代理到 model worker，
+    /// 模型没加载完时它返回的是纯文本错误，这时菜单必须说"加载中"而不是显示 0。
+    var metricsAvailable = false
+    var gpuPct = 0.0
+    var reqRunning = 0
+    var reqWaiting = 0
+}
+
+/// JSONSerialization 给的是 NSNumber，`as? Double` 对整数值不可靠，统一走这里
+private func num(_ v: Any?) -> Double? {
+    if let n = v as? NSNumber { return n.doubleValue }
+    if let d = v as? Double { return d }
+    if let i = v as? Int { return Double(i) }
+    return nil
 }
 
 // MARK: - 服务控制器
@@ -776,20 +793,66 @@ enum Service {
         return start(cfg: cfg)
     }
 
+    /// mlx-serve 的 `generation_tokens_total` 是**累计**值，没有现成的实时速率，
+    /// 只能拿相邻两次采样求差。这是唯一需要跨调用保存的状态。
+    private static var lastMLXSample: (t: Date, tokens: Double)?
+
     /// 状态探测。已暂停（进程冻结）时直接短路，避免每次轮询都等 curl 超时。
     static func status() -> Status {
         var s = Status()
         if paused { return s }
         let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
                                       baseURL + activeEngine.healthPath])
-        // mlx-serve 的 /health 返回的是纯文本（不是 JSON），所以不能要求解析成字典：
-        // 只要 curl 成功且响应非空就算活着，下面的 Splash 专属字段自然为空。
+        // mlx-serve 的 /health 返回 `{"status":"ok"}`（是 JSON，但结构完全不同），
+        // 所以不能套用下面 Splash /status 的解析：只要 curl 成功且响应非空就算活着。
         if activeEngine == .mlx {
+            // /health 只说明服务活着 —— 模型可能还在加载
             if r.status == 0, !r.out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 s.up = true
             }
+            // /metrics.json 才有数字。模型没加载完时它返回的是 mlx-serve 自己的
+            // 纯文本错误（upstream connect failed），解析不成字典 → metricsAvailable 保持 false
+            let m = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
+                                          baseURL + "/metrics.json"])
+            // 这里有两种"没数据"的形态，必须都挡住：
+            //   1) 没开 --metrics  → 返回合法 JSON `{"error":"metrics not enabled …"}`
+            //   2) 模型没加载完    → 返回纯文本 `upstream connect failed: …`
+            // 只看"能不能解析成 JSON"会把第 1 种误判成有数据（解析成功、然后全 0）。
+            guard m.status == 0, let md = m.out.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: md) as? [String: Any],
+                  obj["gauges"] != nil || obj["counters"] != nil
+            else { return s }
+            s.metricsAvailable = true
+            let g = (obj["gauges"] as? [String: Any]) ?? [:]
+            let c = (obj["counters"] as? [String: Any]) ?? [:]
+            if let mb = num(g["memory_mb"]) { s.residentGB = mb / 1024.0 }
+            if let gp = num(g["gpu_utilization_pct"]) { s.gpuPct = gp }
+            if let n = num(g["requests_running"]) { s.reqRunning = Int(n) }
+            if let n = num(g["requests_waiting"]) { s.reqWaiting = Int(n) }
+            // TTFT：直方图只给 count/sum，取平均。
+            // 注意 Splash 报的是 p50、这里算的是均值 —— 所以菜单里两边都只写 "TTFT"，不写 p50
+            if let h = obj["histograms"] as? [String: Any],
+               let tt = h["time_to_first_token_seconds"] as? [String: Any],
+               let cnt = num(tt["count"]), cnt > 0, let sum = num(tt["sum"]) {
+                s.ttftP50 = sum / cnt * 1000.0
+            }
+            // 实时解码速度 = Δ(累计生成 token) / Δ(真实经过时间)
+            if let tot = num(c["generation_tokens_total"]) {
+                let now = Date()
+                if let prev = lastMLXSample {
+                    let dt = now.timeIntervalSince(prev.t)
+                    if dt >= 0.5 {
+                        let d = tot - prev.tokens
+                        s.tps = d >= 0 ? d / dt : 0
+                        lastMLXSample = (now, tot)
+                    }
+                } else {
+                    lastMLXSample = (now, tot)   // 第一次采样只记录基线
+                }
+            }
             return s
         }
+        lastMLXSample = nil   // 换回 Splash 时清掉，避免下次切回来算出离谱的差值
         guard r.status == 0,
               let data = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -936,13 +999,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let runVer = Service.runningVersion()
         let instVer = Service.installedVersion()
         menu.addItem(disabled("\(activeEngine.displayName) \(runVer ?? instVer ?? "?")  ·  \(stateLabel())"))
+        // 两个引擎的 KPI 不是一套：Splash 报草稿接受率，mlx-serve 没有（它的推测解码统计
+        // 只进日志 [spec-stats]），但 mlx-serve 有 GPU 负载。所以按引擎分别渲染，
+        // 不能共用一行——否则会显示一堆恒为 0 的假数字。
         if running {
-            menu.addItem(disabled(String(format: "%.1f tok/s · accept %.1f%% · memory %.1f GB",
-                                         st.tps, st.accept * 100, st.residentGB)))
+            if activeEngine == .mlx {
+                if st.metricsAvailable {
+                    menu.addItem(disabled(String(format: "%.1f tok/s · GPU %.0f%% · memory %.1f GB",
+                                                 st.tps, st.gpuPct, st.residentGB)))
+                } else {
+                    menu.addItem(disabled("⏳ no metrics yet — model still loading?"))
+                }
+            } else {
+                menu.addItem(disabled(String(format: "%.1f tok/s · accept %.1f%% · memory %.1f GB",
+                                             st.tps, st.accept * 100, st.residentGB)))
+            }
         }
         menu.addItem(disabled("\(modelShortName())  ·  \(baseURL.replacingOccurrences(of: "http://", with: ""))"))
         if running {
-            menu.addItem(disabled(String(format: "TTFT %.0f ms · limit %dK", st.ttftP50, st.maxContext / 1024)))
+            if activeEngine == .mlx {
+                // mlx-serve 的 metrics 里没有上下文上限，改成报并发队列
+                if st.metricsAvailable {
+                    var tail = ""
+                    if st.reqRunning > 0 { tail += " · \(st.reqRunning) running" }
+                    if st.reqWaiting > 0 { tail += " · \(st.reqWaiting) waiting" }
+                    menu.addItem(disabled(String(format: "TTFT avg %.0f ms%@", st.ttftP50, tail)))
+                }
+            } else {
+                menu.addItem(disabled(String(format: "TTFT %.0f ms · limit %dK", st.ttftP50, st.maxContext / 1024)))
+            }
         }
         if let r = runVer, let i = instVer, r != i {
             menu.addItem(disabled("⚠️ running \(r) ≠ installed \(i) — restart to switch"))
@@ -1875,8 +1960,17 @@ func runCLI(_ argv: [String]) -> Bool {
         print("managed:   \(Service.managed ? "pid \(Service.recordedPID!)" : "none")")
         print("http:      \(s.up ? "ok" : "no response")")
         if s.up {
-            print(String(format: "speed:     %.1f tok/s · accept %.1f%% · memory %.1f GB",
-                         s.tps, s.accept * 100, s.residentGB))
+            if activeEngine == .mlx {
+                if s.metricsAvailable {
+                    print(String(format: "speed:     %.1f tok/s · GPU %.0f%% · memory %.1f GB · %d running",
+                                 s.tps, s.gpuPct, s.residentGB, s.reqRunning))
+                } else {
+                    print("metrics:   unavailable — model not loaded yet?")
+                }
+            } else {
+                print(String(format: "speed:     %.1f tok/s · accept %.1f%% · memory %.1f GB",
+                             s.tps, s.accept * 100, s.residentGB))
+            }
         }
         print("login:     \(SMAppService.mainApp.status == .enabled ? "registered" : "not registered")")
     case "--start":

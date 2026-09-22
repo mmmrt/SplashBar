@@ -864,7 +864,9 @@ enum Service {
     /// 靠它把上一个真实值留住，并在菜单里标出"多久之前测的"。
     private static var lastMLXRate: (value: Double, at: Date)?
     /// 超过这个年龄就不再显示速率（说明确实空闲了）
-    private static let kMLXRateMaxAge: Double = 30
+    /// 生成结束后速率还保留多久。原来是 30 秒 —— 用户反馈"输出完了还挂好久"。
+    /// 5 秒足够读完最后一个数字，又不会让人觉得它赖着不走。
+    private static let kMLXRateMaxAge: Double = 5
     /// live 计数的历史采样（约 6 秒窗口）。
     /// `generation_tokens_live` 的更新粒度约 1.6 秒 —— 用 1 秒轮询窗口算差值，
     /// 会一会儿是 0、一会儿一次吞掉一整批（实测显示 273、367，而真实只有 184）。
@@ -926,6 +928,10 @@ enum Service {
             let decSum = num((hh["decode_time_seconds"] as? [String: Any])?["sum"]) ?? 0
             if let live = num(g["generation_tokens_live"]) {
                 let now = Date()
+                // **每次采样都记**，空闲时也记 —— 否则生成刚开始时历史是空的，
+                // 要等到第 2 次采样才有基线，首次出数就慢了一拍。
+                mlxLiveHistory.append((now, live))
+                mlxLiveHistory.removeAll { now.timeIntervalSince($0.t) > 6 }
                 if let prev = lastMLXSample {
                     var rate: Double?
                     let dOut = outSum - prev.outTokens
@@ -941,9 +947,12 @@ enum Service {
                         // （实测 123 → 48 → …），而这时正确的做法是保留上一个准确值。
                         //    基线要往前取 ~2.5 秒 —— 它的更新粒度约 1.6 秒，
                         //    用 1 秒窗口会一次吞掉一整批，算出来虚高（实测 367 vs 真实 184）。
-                        mlxLiveHistory.append((now, live))
-                        mlxLiveHistory.removeAll { now.timeIntervalSince($0.t) > 6 }
-                        if let base = mlxLiveHistory.first(where: { now.timeIntervalSince($0.t) >= 2.5 }) {
+                        // 优先取 ~2.5 秒前的基线（跨过计数器约 1.6 秒的刷新粒度），
+                        // 但刚进入生成时还没有那么早的样本 —— 这时退回用最老的样本，
+                        // 宁可数字略糙也要尽早出数（原来越是等基线越显得"迟了 2-3 秒"）。
+                        let base = mlxLiveHistory.first { now.timeIntervalSince($0.t) >= 2.5 }
+                                ?? mlxLiveHistory.first
+                        if let base = base, base.t < now {
                             let dLive = live - base.v
                             let dt = now.timeIntervalSince(base.t)
                             if dLive > 0, dt > 0 { rate = dLive / dt }
@@ -1322,7 +1331,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // 所以菜单栏是**间歇性变宽**，而不是常驻变宽。
         var text = ""
         if cfg.showModelName { text += " " + modelShortName() }
-        if cfg.showSpeed, st.tps > 0 { text += String(format: " %.0f t/s", st.tps) }
+        if cfg.showSpeed, st.tps > 0 {
+            // 有模型名时用 · 隔开，否则两者会连成一片看不出边界
+            text += (text.isEmpty ? " " : " · ") + String(format: "%.0f t/s", st.tps)
+        }
 
         button.imagePosition = text.isEmpty ? .imageOnly : .imageLeading
         // 等宽数字：比例字体下 "174" 和 "99" 宽度不同，每秒变一次会让整个图标左右跳。

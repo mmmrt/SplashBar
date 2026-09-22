@@ -96,8 +96,12 @@ func syncPort(_ p: String) { activePort = p.isEmpty ? activeEngine.defaultPort :
 func applyConfig(_ cfg: Config) {
     syncEngine(cfg.engine)
     switch cfg.engine {
-    case .splash: syncPort(cfg.port)
-    case .mlx:    syncPort(cfg.mlx.port)
+    case .splash:
+        syncPort(cfg.port)
+        activeModelDirOverride = cfg.modelDirSplash
+    case .mlx:
+        syncPort(cfg.mlx.port)
+        activeModelDirOverride = cfg.mlx.modelDir
     }
 }
 
@@ -140,8 +144,36 @@ private let kGatedParams: [(tag: Int, flag: String)] = [
     (kTagWebUI,          "--no-webui"),
 ]
 
+/// mlx-serve 专属参数。tag 从 11 起编号，和 Splash 的 1–8 严格分开，
+/// 这样同一个 tag 不会在两个引擎下含义不同。
+private let kTagMlxPort       = 11
+private let kTagMlxHost       = 12
+private let kTagMlxCtx        = 13
+private let kTagMlxKvQuant    = 14
+private let kTagMlxPrefixDisk = 15
+private let kTagMlxResident   = 16
+private let kTagMlxIdle       = 17
+private let kTagMlxDrafter    = 18
+private let kTagMlxVision     = 19
+private let kTagMlxMetrics    = 20
+
+/// MLX 版的能力约束表。语义和 kGatedParams 完全一致：
+/// 引擎 `--help` 里没有这个 flag，整组就置灰、且不拼进命令行。
+private let kMlxGatedParams: [(tag: Int, flag: String)] = [
+    (kTagMlxPort,       "--port"),
+    (kTagMlxHost,       "--host"),
+    (kTagMlxCtx,        "--ctx-size"),
+    (kTagMlxKvQuant,    "--kv-quant"),
+    (kTagMlxPrefixDisk, "--prefix-cache-disk"),
+    (kTagMlxResident,   "--max-resident-models"),
+    (kTagMlxIdle,       "--idle-evict-secs"),
+    (kTagMlxDrafter,    "--drafter"),
+    (kTagMlxVision,     "--no-vision"),
+    (kTagMlxMetrics,    "--metrics"),
+]
+
 private func flagForTag(_ tag: Int) -> String? {
-    kGatedParams.first { $0.tag == tag }?.flag
+    (kGatedParams + kMlxGatedParams).first { $0.tag == tag }?.flag
 }
 // sys/proc.h: SIDL=1 SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5
 // 注意 SSTOP 是 4，写成 3(SSLEEP) 会导致暂停永远检测不到
@@ -154,18 +186,46 @@ private var configURL:     URL { appSupportDir.appendingPathComponent("config.js
 private var pidURL:        URL { appSupportDir.appendingPathComponent("splash.pid") }
 private var logOutPath: String { homeURL().appendingPathComponent("Library/Logs/splashbar.out.log").path }
 private var logErrPath: String { homeURL().appendingPathComponent("Library/Logs/splashbar.err.log").path }
+/// 用户手动指定的模型目录（空 = 自动发现）。
+/// 下面的路径变量和 Service 一样是全局的、拿不到 AppDelegate 的 cfg，
+/// 所以由 applyConfig 统一同步进来。每个引擎各存一个。
+var activeModelDirOverride: String = ""
+
+/// 从 splash 二进制反推出它的「程序根」——也就是 install/paths.py 里的 ROOT。
+/// 布局是 `<X>/bin/splash` + `<X>/libexec/install/paths.py`，
+/// 而 `ROOT = parents[1]` 正好是 `<X>/libexec`。
+private func splashRootFromBinary() -> String? {
+    let resolved = URL(fileURLWithPath: kSplashBin).resolvingSymlinksInPath().path
+    var p = resolved
+    for _ in 0..<2 { p = (p as NSString).deletingLastPathComponent }   // <X>/bin/splash → <X>
+    for cand in [p + "/libexec", p] where
+        FileManager.default.fileExists(atPath: cand + "/release.json") { return cand }
+    return nil
+}
+
+/// Splash 的模型目录 —— **照抄 install/paths.py 的判定**，不写死：
+///     PACKAGED = (ROOT)/release.json 存在？
+///     MODELS   = ~/Library/Application Support/Splash/models   if PACKAGED（brew 装）
+///              = <ROOT>/install/models                          else（源码/解包跑）
+/// brew 安装是 PACKAGED；从源码或 release 包解压运行则完全不同，
+/// 所以"每台电脑路径不一样"是真实存在的，必须按引擎自己的规则算。
 private var splashModelsDir: URL {
-    homeURL().appendingPathComponent("Library/Application Support/Splash/models")
+    let userData = homeURL().appendingPathComponent("Library/Application Support/Splash/models")
+    guard let root = splashRootFromBinary() else { return userData }   // 问不到就退回 brew 默认
+    if FileManager.default.fileExists(atPath: root + "/release.json") { return userData }
+    return URL(fileURLWithPath: root).appendingPathComponent("install/models")
 }
 
-/// mlx-serve 的模型库（`mlx-serve pull` 落到这里）。
-/// 本机已把它软链到 /Users/mrt/Models，所以扫这里等价于扫那个目录。
+/// mlx-serve 的模型库。默认 `~/.mlx-serve/models`，但它是 `--model-dir` 可改的，
+/// 所以用户能手动覆盖（本机默认目录已软链到 /Users/mrt/Models）。
 private var mlxModelsDir: URL {
-    homeURL().appendingPathComponent(".mlx-serve/models")
+    if !activeModelDirOverride.isEmpty { return URL(fileURLWithPath: activeModelDirOverride) }
+    return homeURL().appendingPathComponent(".mlx-serve/models")
 }
 
-/// 当前引擎的模型目录（Open models folder 用）
+/// 当前引擎的模型目录（扫描 + Open models folder 用）
 private var engineModelsDir: URL {
+    if !activeModelDirOverride.isEmpty { return URL(fileURLWithPath: activeModelDirOverride) }
     switch activeEngine {
     case .splash: return splashModelsDir
     case .mlx:    return mlxModelsDir
@@ -211,6 +271,8 @@ struct MLXConfig: Codable {
     var noMTP: Bool = false
     /// --drafter：Gemma 4 assistant 或 DFlash block-drafter 的目录
     var drafter: String = ""
+    /// 手动指定模型目录（空 = 自动发现）。兜住 --model-dir 指到别处的情况
+    var modelDir: String = ""
 
     init() {}
 
@@ -231,6 +293,7 @@ struct MLXConfig: Codable {
         enablePLD         = (try? c.decode(Bool.self, forKey: .enablePLD)) ?? enablePLD
         noMTP             = (try? c.decode(Bool.self, forKey: .noMTP)) ?? noMTP
         drafter           = (try? c.decode(String.self, forKey: .drafter)) ?? drafter
+        modelDir          = (try? c.decode(String.self, forKey: .modelDir)) ?? modelDir
     }
 
     /// 拼出 mlx-serve 的启动参数。
@@ -289,6 +352,8 @@ final class Config: Codable {
     /// 注意：这是实验特性，只有上游 PR #3 的 SSD-tier 构建才认识它，
     /// 正式版（含 1.0.1）传了会让 argparse 直接退出、服务起不来 —— 见 serveArguments 的过滤。
     var maxCacheDisk: String = ""
+    /// 手动指定 Splash 的模型目录（空 = 按 install/paths.py 的规则自动判定）
+    var modelDirSplash: String = ""
     var noWebUI: Bool = false
     var loginItem: Bool = false
     var autoStartOnLaunch: Bool = false
@@ -312,6 +377,7 @@ final class Config: Codable {
         maxRequestSize    = (try? c.decode(String.self, forKey: .maxRequestSize)) ?? maxRequestSize
         maxImagePixels    = (try? c.decode(String.self, forKey: .maxImagePixels)) ?? maxImagePixels
         maxCacheDisk      = (try? c.decode(String.self, forKey: .maxCacheDisk)) ?? maxCacheDisk
+        modelDirSplash    = (try? c.decode(String.self, forKey: .modelDirSplash)) ?? modelDirSplash
         noWebUI           = (try? c.decode(Bool.self, forKey: .noWebUI)) ?? noWebUI
         loginItem         = (try? c.decode(Bool.self, forKey: .loginItem)) ?? loginItem
         autoStartOnLaunch = (try? c.decode(Bool.self, forKey: .autoStartOnLaunch)) ?? autoStartOnLaunch
@@ -870,6 +936,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // 两个引擎是互斥的（一次只跑一个），切换时若当前引擎在跑会先停掉。
         menu.addItem(submenuItem("Engine  ·  \(activeEngine.displayName)", items: engineItems()))
 
+        // ── 模型选择：清单按当前引擎刷新（MLX 走 `mlx-serve list`，Splash 扫目录）
+        menu.addItem(submenuItem("Model  ·  \(modelShortName())", items: modelItems()))
+
         // 启动：运行中 / 端口被占用时置灰；暂停时充当"继续"
         let startItem = NSMenuItem(title: isPaused ? "▶  Resume" : "▶  Start",
                                    action: #selector(startService), keyEquivalent: "s")
@@ -913,8 +982,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             settingsItems.append(disabled("Could not query the engine — options left enabled"))
             settingsItems.append(.separator())
         }
+        if activeEngine == .mlx {
+            settingsItems += mlxSettingsItems()
+        } else {
         settingsItems += [
-            submenuItem("Model", items: modelItems()),
             gatedSubmenu("Max memory  --max-memory", tag: kTagMaxMemory, items: choiceItems(
                 current: cfg.maxMemory,
                 options: [("auto", "auto (≈107 GB, M5 Max limit)"),
@@ -953,7 +1024,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                           ("8G", "8G"), ("16G", "16G"), ("32G", "32G"), ("64G", "64G")],
                 customLabel: "Custom… (e.g. 12G)", tag: kTagCacheDisk)),
         ]
-        menu.addItem(submenuItem("Settings", items: settingsItems))
+        }
+        // 渐进式披露：引擎没跑起来时不展开 Settings，菜单保持精简。
+        // 引擎/模型/启停始终在顶层，所以不会出现"想配置却无处可点"的死锁。
+        if running { menu.addItem(submenuItem("Settings", items: settingsItems)) }
 
         // ── 打开：5 个入口收进一个子菜单（原来平铺占 5 行）
         let openUI = NSMenuItem(title: "Open Web UI in browser", action: #selector(openWebUI), keyEquivalent: "o")
@@ -1127,6 +1201,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return items
     }
 
+    /// mlx-serve 的参数菜单。字段全部来自 `MLXConfig`（与 Splash 那套完全隔离），
+    /// 每一项都过 `gatedSubmenu` —— 引擎 `--help` 里没有该 flag 就整组置灰。
+    private func mlxSettingsItems() -> [NSMenuItem] {
+        var items: [NSMenuItem] = []
+
+        items.append(gatedSubmenu("Port  --port", tag: kTagMlxPort, items: choiceItems(
+            current: cfg.mlx.port,
+            options: [("11234", "11234 (mlx-serve default)"),
+                      ("8000", "8000"), ("8080", "8080"),
+                      ("11434", "11434 (Ollama drop-in)")],
+            customLabel: "Custom… (e.g. 11235)", tag: kTagMlxPort)))
+
+        items.append(gatedSubmenu("Bind address  --host", tag: kTagMlxHost, items: choiceItems(
+            current: cfg.mlx.host,
+            options: [("", "Engine default (0.0.0.0)"),
+                      ("127.0.0.1", "127.0.0.1 (loopback only)"),
+                      ("0.0.0.0", "0.0.0.0 (all interfaces)")],
+            customLabel: "Custom… (e.g. 192.168.1.5)", tag: kTagMlxHost)))
+
+        items.append(gatedSubmenu("Context  --ctx-size", tag: kTagMlxCtx, items: choiceItems(
+            current: cfg.mlx.ctxSize,
+            options: [("", "auto (budgeted from model + GPU memory)"),
+                      ("32768", "32K"), ("65536", "64K"),
+                      ("131072", "128K"), ("262144", "256K")],
+            customLabel: "Custom… (e.g. 96K)", tag: kTagMlxCtx)))
+
+        items.append(gatedSubmenu("KV cache quant  --kv-quant", tag: kTagMlxKvQuant, items: choiceItems(
+            current: cfg.mlx.kvQuant,
+            options: [("off", "off (default)"), ("4", "4-bit"), ("8", "8-bit")],
+            customLabel: "Custom…", tag: kTagMlxKvQuant)))
+
+        items.append(gatedSubmenu("Prefix cache SSD  --prefix-cache-disk", tag: kTagMlxPrefixDisk, items: choiceItems(
+            current: cfg.mlx.prefixCacheDisk,
+            options: [("", "Off (default)"),
+                      ("4GB", "4GB"), ("10GB", "10GB"), ("32GB", "32GB")],
+            customLabel: "Custom… (e.g. 10GB)", tag: kTagMlxPrefixDisk)))
+
+        items.append(gatedSubmenu("Max resident models  --max-resident-models", tag: kTagMlxResident, items: choiceItems(
+            current: cfg.mlx.maxResidentModels,
+            options: [("", "Engine default (3)"), ("1", "1"), ("2", "2"), ("3", "3")],
+            customLabel: "Custom…", tag: kTagMlxResident)))
+
+        items.append(gatedSubmenu("Idle evict  --idle-evict-secs", tag: kTagMlxIdle, items: choiceItems(
+            current: cfg.mlx.idleEvictSecs,
+            options: [("", "Off (default)"), ("300", "300 s"), ("900", "900 s"), ("3600", "3600 s")],
+            customLabel: "Custom… (seconds)", tag: kTagMlxIdle)))
+
+        items.append(gatedSubmenu("Drafter  --drafter", tag: kTagMlxDrafter, items: choiceItems(
+            current: cfg.mlx.drafter,
+            options: [("", "Auto (use the checkpoint's own)")],
+            customLabel: "Custom… (drafter folder)", tag: kTagMlxDrafter)))
+
+        items.append(gatedSubmenu("Vision  --no-vision", tag: kTagMlxVision, items: choiceItems(
+            current: cfg.mlx.noVision ? "off" : "on",
+            options: [("on", "Load the vision encoder"),
+                      ("off", "Skip it (saves memory)")],
+            customLabel: "Custom…", tag: kTagMlxVision)))
+
+        items.append(gatedSubmenu("Metrics  --metrics", tag: kTagMlxMetrics, items: choiceItems(
+            current: cfg.mlx.metrics ? "on" : "off",
+            options: [("off", "Off (default)"),
+                      ("on", "Prometheus /metrics + index panel")],
+            customLabel: "Custom…", tag: kTagMlxMetrics)))
+
+        items.append(.separator())
+        items.append(submenuItem("Model folder…", items: modelDirItems()))
+
+        return items
+    }
+
+    /// 手动指定模型目录 —— 兜住"每台电脑路径不一致"和 `--model-dir` 指到别处的情况。
+    private func modelDirItems() -> [NSMenuItem] {
+        let cur = activeEngine == .mlx ? cfg.mlx.modelDir : cfg.modelDirSplash
+        var items: [NSMenuItem] = []
+        items.append(disabled(engineModelsDir.path))
+        items.append(.separator())
+        let pick = NSMenuItem(title: "Choose folder…", action: #selector(pickModelDir), keyEquivalent: "")
+        pick.target = self
+        items.append(pick)
+        let auto = NSMenuItem(title: "Use auto-detected", action: #selector(clearModelDir), keyEquivalent: "")
+        auto.target = self
+        auto.isEnabled = !cur.isEmpty
+        items.append(auto)
+        return items
+    }
+
+    @objc func pickModelDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = engineModelsDir
+        panel.prompt = "Use this folder"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if activeEngine == .mlx { cfg.mlx.modelDir = url.path } else { cfg.modelDirSplash = url.path }
+        cfg.save(); applyConfig(cfg); refresh()
+    }
+
+    @objc func clearModelDir() {
+        if activeEngine == .mlx { cfg.mlx.modelDir = "" } else { cfg.modelDirSplash = "" }
+        cfg.save(); applyConfig(cfg); refresh()
+    }
+
     private func apiKeyItems() -> [NSMenuItem] {
         let cur = cfg.apiKey.isEmpty ? "not set (no auth)" : "set (\(cfg.apiKey.count) chars)"
         let items = [disabled("Current: \(cur)"), NSMenuItem.separator()]
@@ -1246,9 +1423,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         var out = Set<String>()
 
         // 1) App 托管目录：<models>/<owner>/<name>
-        if let owners = try? fm.contentsOfDirectory(atPath: splashModelsDir.path) {
+        //    用 engineModelsDir 而非 splashModelsDir，这样"手动指定的目录"也生效
+        if let owners = try? fm.contentsOfDirectory(atPath: engineModelsDir.path) {
             for owner in owners where !owner.hasPrefix(".") {
-                let dir = splashModelsDir.appendingPathComponent(owner)
+                let dir = engineModelsDir.appendingPathComponent(owner)
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { continue }
                 if let names = try? fm.contentsOfDirectory(atPath: dir.path) {
@@ -1399,6 +1577,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case kTagMaxRequestSize: cfg.maxRequestSize = v
         case kTagMaxImagePixels: cfg.maxImagePixels = v
         case kTagCacheDisk:      cfg.maxCacheDisk = v
+        // ── MLX 专属（写入 cfg.mlx，与 Splash 那套完全隔离）
+        case kTagMlxPort:        cfg.mlx.port = v
+        case kTagMlxHost:        cfg.mlx.host = v
+        case kTagMlxCtx:         cfg.mlx.ctxSize = v
+        case kTagMlxKvQuant:     cfg.mlx.kvQuant = v
+        case kTagMlxPrefixDisk:  cfg.mlx.prefixCacheDisk = v
+        case kTagMlxResident:    cfg.mlx.maxResidentModels = v
+        case kTagMlxIdle:        cfg.mlx.idleEvictSecs = v
+        case kTagMlxDrafter:     cfg.mlx.drafter = v
+        case kTagMlxVision:      cfg.mlx.noVision = (v == "off")
+        case kTagMlxMetrics:     cfg.mlx.metrics = (v == "on")
         default: return
         }
         cfg.save()
@@ -1442,6 +1631,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case kTagMaxRequestSize: return ("Custom max request size", "e.g. 64M / 1G", cfg.maxRequestSize)
         case kTagMaxImagePixels: return ("Custom max image pixels", "integer pixel count, e.g. 4194304", cfg.maxImagePixels)
         case kTagCacheDisk:      return ("Custom max cache disk", "e.g. 8G / 12G / 64G", cfg.maxCacheDisk)
+        // ── MLX 专属
+        case kTagMlxPort:        return ("Custom port", "1-65535, e.g. 11235", cfg.mlx.port)
+        case kTagMlxHost:        return ("Custom bind address", "e.g. 0.0.0.0 / 127.0.0.1", cfg.mlx.host)
+        case kTagMlxCtx:         return ("Custom context size", "e.g. 32768 / 128K", cfg.mlx.ctxSize)
+        case kTagMlxPrefixDisk:  return ("Custom prefix-cache SSD tier", "e.g. 10GB / 32GB", cfg.mlx.prefixCacheDisk)
+        case kTagMlxResident:    return ("Custom max resident models", "e.g. 2", cfg.mlx.maxResidentModels)
+        case kTagMlxIdle:        return ("Custom idle evict seconds", "e.g. 300", cfg.mlx.idleEvictSecs)
+        case kTagMlxDrafter:     return ("Custom drafter directory",
+                                         "Gemma 4 assistant or DFlash block-drafter folder", cfg.mlx.drafter)
         default:                 return ("Custom context length", "e.g. 100K / 32768", cfg.maxContext)
         }
     }

@@ -323,12 +323,28 @@ struct MLXConfig: Codable {
     /// 和 Splash 一样：**每个可选 flag 都先问引擎认不认识**，
     /// 传了不认识的选项会 argparse 直接退出、服务起不来。
     /// 模型为空时用 `serve` 子命令（按需加载整个库），否则用 `--serve` 标志形式。
+    /// mlx-serve 的 `--model` 收的是**目录路径**，不是库里的 `org/repo` 短名 ——
+    /// 而模型清单给的恰恰是短名（`mlx-serve list` 的输出就是 `org/repo`）。
+    /// 直接把短名喂给 `--model`，引擎会当成相对路径去找，启动即 `error: FileNotFound`。
+    ///
+    /// 所以：绝对路径原样用；短名解析成 `<模型目录>/<org>/<repo>`；
+    /// 解析出来的目录不存在就退化成不带 --model 的 `serve`（按需加载），
+    /// 这样至少服务能起来，而不是死在启动阶段。
+    var resolvedModelPath: String {
+        if model.isEmpty { return "" }
+        if model.hasPrefix("/") { return model }
+        let p = mlxModelsDir.appendingPathComponent(model).path
+        return FileManager.default.fileExists(atPath: p) ? p : ""
+    }
+
     var serveArguments: [String] {
         var a: [String] = []
-        if model.isEmpty {
+        let path = resolvedModelPath
+        if path.isEmpty {
+            // 不带 --model：走 `serve` 的按需加载，请求里点名 org/repo 即可
             a = ["serve"]
         } else {
-            a = ["--model", model, "--serve"]
+            a = ["--model", path, "--serve"]
         }
         if !port.isEmpty, port != Engine.mlx.defaultPort, Service.flagAvailable("--port") {
             a += ["--port", port]

@@ -185,6 +185,10 @@ private func flagForTag(_ tag: Int) -> String? {
 // 注意 SSTOP 是 4，写成 3(SSLEEP) 会导致暂停永远检测不到
 private let kSSTOP: UInt32 = 4
 
+/// 标记需要原地更新的菜单行（见 updateOpenMenuValues）
+private let kKpiSpeed = "kpi:speed"
+private let kKpiTtft  = "kpi:ttft"
+
 private func homeURL() -> URL { FileManager.default.homeDirectoryForCurrentUser }
 
 private var appSupportDir: URL { homeURL().appendingPathComponent("Library/Application Support/SplashMLX") }
@@ -1079,6 +1083,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let s = Service.status()
             DispatchQueue.main.async {
                 self?.st = s
+                self?.updateOpenMenuValues()   // 已展开的菜单是旧对象，必须原地改
                 self?.rebuildMenu()
             }
         }
@@ -1117,31 +1122,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // 只进日志 [spec-stats]），但 mlx-serve 有 GPU 负载。所以按引擎分别渲染，
         // 不能共用一行——否则会显示一堆恒为 0 的假数字。
         if running {
-            if activeEngine == .mlx {
-                if st.metricsAvailable {
-                    menu.addItem(disabled(String(format: "%@ · GPU %.0f%% · memory %.1f GB",
-                                                 mlxSpeedLabel(), st.gpuPct, st.residentGB)))
-                } else {
-                    menu.addItem(disabled("⏳ no metrics yet — model still loading?"))
-                }
-            } else {
-                menu.addItem(disabled(String(format: "%.1f tok/s · accept %.1f%% · memory %.1f GB",
-                                             st.tps, st.accept * 100, st.residentGB)))
-            }
+            let it = disabled(speedLineText())
+            it.representedObject = kKpiSpeed      // 供 updateOpenMenuValues 原地更新
+            menu.addItem(it)
         }
         menu.addItem(disabled("\(modelShortName())  ·  \(baseURL.replacingOccurrences(of: "http://", with: ""))"))
-        if running {
-            if activeEngine == .mlx {
-                // mlx-serve 的 metrics 里没有上下文上限，改成报并发队列
-                if st.metricsAvailable {
-                    var tail = ""
-                    if st.reqRunning > 0 { tail += " · \(st.reqRunning) running" }
-                    if st.reqWaiting > 0 { tail += " · \(st.reqWaiting) waiting" }
-                    menu.addItem(disabled(String(format: "TTFT avg %.0f ms%@", st.ttftP50, tail)))
-                }
-            } else {
-                menu.addItem(disabled(String(format: "TTFT %.0f ms · limit %dK", st.ttftP50, st.maxContext / 1024)))
-            }
+        if running, let t = ttftLineText() {
+            let it = disabled(t)
+            it.representedObject = kKpiTtft
+            menu.addItem(it)
         }
         if let r = runVer, let i = instVer, r != i {
             menu.addItem(disabled("⚠️ running \(r) ≠ installed \(i) — restart to switch"))
@@ -1385,6 +1374,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         custom.tag = tag
         items.append(custom)
         return items
+    }
+
+    /// 速率行的文字（两个引擎各一套指标）
+    private func speedLineText() -> String {
+        if activeEngine == .mlx {
+            guard st.metricsAvailable else { return "⏳ no metrics yet — model still loading?" }
+            return String(format: "%@ · GPU %.0f%% · memory %.1f GB",
+                          mlxSpeedLabel(), st.gpuPct, st.residentGB)
+        }
+        return String(format: "%.1f tok/s · accept %.1f%% · memory %.1f GB",
+                      st.tps, st.accept * 100, st.residentGB)
+    }
+
+    /// TTFT 行；MLX 侧没有上下文上限，改报并发队列。无可显示内容时返回 nil
+    private func ttftLineText() -> String? {
+        if activeEngine == .mlx {
+            guard st.metricsAvailable else { return nil }
+            var tail = ""
+            if st.reqRunning > 0 { tail += " · \(st.reqRunning) running" }
+            if st.reqWaiting > 0 { tail += " · \(st.reqWaiting) waiting" }
+            return String(format: "TTFT avg %.0f ms%@", st.ttftP50, tail)
+        }
+        return String(format: "TTFT %.0f ms · limit %dK", st.ttftP50, st.maxContext / 1024)
+    }
+
+    /// 把**当前已展开**的菜单里那几行原地改掉文字。
+    ///
+    /// 这是"速率滞后"的最后一块：替换 `statusItem.menu` **不会**刷新已经展开的菜单
+    /// —— 展开中的仍是旧对象。于是用户盯着菜单看时只能看到打开那一刻的数值，
+    /// 关掉再打开（多半生成已结束）才更新，表现就是"输出都完了才显示速度"。
+    /// 原地改 title 才能让展开中的菜单实时反映。
+    private func updateOpenMenuValues() {
+        guard let menu = statusItem?.menu else { return }
+        for it in menu.items {
+            switch it.representedObject as? String {
+            case kKpiSpeed: it.title = speedLineText()
+            case kKpiTtft:  it.title = ttftLineText() ?? it.title
+            default: break
+            }
+        }
     }
 
     /// mlx-serve 的速率文案。

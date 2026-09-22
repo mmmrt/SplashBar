@@ -181,11 +181,24 @@ private let kSSTOP: UInt32 = 4
 
 private func homeURL() -> URL { FileManager.default.homeDirectoryForCurrentUser }
 
-private var appSupportDir: URL { homeURL().appendingPathComponent("Library/Application Support/SplashBar") }
+private var appSupportDir: URL { homeURL().appendingPathComponent("Library/Application Support/SplashMLX") }
+/// 改名前（SplashBar）的数据目录，仅用于一次性迁移
+private var legacyAppSupportDir: URL { homeURL().appendingPathComponent("Library/Application Support/SplashBar") }
 private var configURL:     URL { appSupportDir.appendingPathComponent("config.json") }
-private var pidURL:        URL { appSupportDir.appendingPathComponent("splash.pid") }
-private var logOutPath: String { homeURL().appendingPathComponent("Library/Logs/splashbar.out.log").path }
-private var logErrPath: String { homeURL().appendingPathComponent("Library/Logs/splashbar.err.log").path }
+private var pidURL:        URL { appSupportDir.appendingPathComponent("splash-mlx.pid") }
+private var logOutPath: String { homeURL().appendingPathComponent("Library/Logs/splashmlx.out.log").path }
+private var logErrPath: String { homeURL().appendingPathComponent("Library/Logs/splashmlx.err.log").path }
+
+/// 一次性把旧 Splash-MLX 的配置搬到 SplashMLX。
+/// **只在目标不存在时搬**，绝不覆盖 —— 否则用户在新版里的设置会被老配置顶掉。
+func migrateLegacyConfigIfNeeded() {
+    let fm = FileManager.default
+    guard !fm.fileExists(atPath: configURL.path) else { return }
+    let src = legacyAppSupportDir.appendingPathComponent("config.json")
+    guard fm.fileExists(atPath: src.path) else { return }
+    try? fm.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+    try? fm.copyItem(at: src, to: configURL)
+}
 /// 用户手动指定的模型目录（空 = 自动发现）。
 /// 下面的路径变量和 Service 一样是全局的、拿不到 AppDelegate 的 cfg，
 /// 所以由 applyConfig 统一同步进来。每个引擎各存一个。
@@ -385,6 +398,7 @@ final class Config: Codable {
     }
 
     static func load() -> Config {
+        migrateLegacyConfigIfNeeded()   // 从旧的 Splash-MLX 目录搬一次配置（幂等）
         if let data = try? Data(contentsOf: configURL),
            let cfg = try? JSONDecoder().decode(Config.self, from: data) {
             return cfg
@@ -657,7 +671,7 @@ enum Service {
     private static var cachedFingerprint: String?
 
     /// 引擎换了（升级 / 降级 / 重装）就让所有探测缓存失效。
-    /// 没有这一步，用户装完支持 --max-cache-disk 的引擎还得重启 SplashBar
+    /// 没有这一步，用户装完支持 --max-cache-disk 的引擎还得重启 Splash-MLX
     /// 那一项才会从置灰变可用 —— 而"装上就自动可用"正是这里承诺的行为。
     private static func invalidateCachesIfEngineChanged() {
         let fp = engineFingerprint()
@@ -928,7 +942,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if let r = runVer, let i = instVer, r != i {
             menu.addItem(disabled("⚠️ running \(r) ≠ installed \(i) — restart to switch"))
         }
-        if external { menu.addItem(disabled("⚠️ port held by an external process, not managed by SplashBar")) }
+        if external { menu.addItem(disabled("⚠️ port held by an external process, not managed by Splash-MLX")) }
         if starting { menu.addItem(disabled("⏳ loading model…")) }
         menu.addItem(.separator())
 
@@ -1013,7 +1027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                           ("1048576", "1M  = 1048576"), ("2097152", "2M  = 2097152"),
                           ("4194304", "4M  = 4194304"), ("8388608", "8M  = 8388608")],
                 customLabel: "Custom… (pixel count)", tag: kTagMaxImagePixels)),
-            // 这一项不是 CLI 参数：SplashBar 通过环境变量注入（--api-key 的 default 就是它）
+            // 这一项不是 CLI 参数：Splash-MLX 通过环境变量注入（--api-key 的 default 就是它）
             submenuItem("API Key  $SPLASH_API_KEY", items: apiKeyItems()),
             gatedSubmenu("Allowed host  --allowed-host", tag: kTagAllowedHost, items: hostItems()),
             gatedSubmenu("Web UI  --no-webui", tag: kTagWebUI, items: webUIItems()),
@@ -1054,12 +1068,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         login.target = self
         login.state = cfg.loginItem ? .on : .off
 
-        let about = NSMenuItem(title: "About SplashBar", action: #selector(showAbout), keyEquivalent: "")
+        let about = NSMenuItem(title: "About Splash-MLX", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
         menu.addItem(submenuItem("Preferences & About", items: [showName, login, .separator(), about]))
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Quit SplashBar (stops the service)",
+        let quit = NSMenuItem(title: "Quit Splash-MLX (stops the service)",
                               action: #selector(confirmQuit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -1106,7 +1120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         button.image = menuBarIcon()
         button.imagePosition = cfg.showModelName ? .imageLeading : .imageOnly
         button.title = cfg.showModelName ? " " + modelShortName() : ""
-        button.toolTip = "SplashBar — \(cfg.model)"
+        button.toolTip = "Splash-MLX — \(cfg.model)"
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -1466,7 +1480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func startService() {
         // 暂停态下"启动"即"继续"
         if Service.paused {
-            print("[SplashBar] \(Service.resume())")
+            print("[Splash-MLX] \(Service.resume())")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.refresh() }
             return
         }
@@ -1475,7 +1489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let cfgNow = cfg
         DispatchQueue.global().async { [weak self] in
             let msg = Service.start(cfg: cfgNow)
-            print("[SplashBar] \(msg)")
+            print("[Splash-MLX] \(msg)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 self?.starting = false
                 self?.refresh()
@@ -1484,7 +1498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func pauseService() {
-        print("[SplashBar] \(Service.pause())")
+        print("[Splash-MLX] \(Service.pause())")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.refresh() }
     }
 
@@ -1500,7 +1514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             for p in Service.pidsOnPort() { kill(p, SIGKILL) }
             try? FileManager.default.removeItem(at: pidURL)
             let msg = Service.start(cfg: cfgNow)
-            print("[SplashBar] take-over: killed external process(es) [\(killed.map(String.init).joined(separator: ","))]; \(msg)")
+            print("[Splash-MLX] take-over: killed external process(es) [\(killed.map(String.init).joined(separator: ","))]; \(msg)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 self?.starting = false
                 self?.refresh()
@@ -1510,19 +1524,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func confirmQuit() {
         let a = NSAlert()
-        a.messageText = "Quit SplashBar?"
+        a.messageText = "Quit Splash-MLX?"
         a.informativeText = """
         Quitting will also stop the inference service:
         \(cfg.model)
 
-        Reopen SplashBar to start it again.
+        Reopen Splash-MLX to start it again.
         """
         a.alertStyle = .warning
         a.addButton(withTitle: "Quit and stop service")
         a.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        print("[SplashBar] quit: \(Service.stop())")
+        print("[Splash-MLX] quit: \(Service.stop())")
         NSApp.terminate(nil)
     }
 
@@ -1535,7 +1549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func stopService() {
         DispatchQueue.global().async { [weak self] in
             let msg = Service.stop()
-            print("[SplashBar] \(msg)")
+            print("[Splash-MLX] \(msg)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self?.refresh() }
         }
     }
@@ -1546,7 +1560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let cfgNow = cfg
         DispatchQueue.global().async { [weak self] in
             let msg = Service.restart(cfg: cfgNow)
-            print("[SplashBar] \(msg)")
+            print("[Splash-MLX] \(msg)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 self?.starting = false
                 self?.refresh()
@@ -1686,7 +1700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             a.informativeText = """
             \(error.localizedDescription)
 
-            You can add it manually: System Settings → General → Login Items & Extensions → Open at Login → add SplashBar.app
+            You can add it manually: System Settings → General → Login Items & Extensions → Open at Login → add SplashMLX.app
             """
             a.addButton(withTitle: "OK")
             NSApp.activate(ignoringOtherApps: true)
@@ -1712,7 +1726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // 版本号只认 Info.plist，避免两处各写一份对不上
         let appVer = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         let alert = NSAlert()
-        alert.messageText = "SplashBar \(appVer)"
+        alert.messageText = "Splash-MLX \(appVer)"
         alert.informativeText = """
         Menu-bar controller for the local Splash inference server
 
@@ -1811,22 +1825,22 @@ func runCLI(_ argv: [String]) -> Bool {
         break
     case "--help", "-h":
         print("""
-        SplashBar CLI
+        Splash-MLX CLI
 
-          SplashBar --status     Show service state and current arguments
-          SplashBar --start      Start (detached session; survives quitting this app)
-          SplashBar --pause      Freeze the process group with SIGSTOP (memory stays held)
-          SplashBar --resume     Thaw with SIGCONT
-          SplashBar --stop       Stop (kill the whole process group)
-          SplashBar --restart    Restart
-          SplashBar --login-on   Register as a login item (launch SplashBar and start the service at login)
-          SplashBar --login-off  Unregister the login item
-          SplashBar --takeover   Kill the external process holding the port and take it over
-          SplashBar --states     Print the menu state-machine truth table plus the live state
-          SplashBar --dump-menu  Build the real menu and recursively print item availability (post-AppKit-validation)
-          SplashBar --version-of <path>  Run the version parser against an executable path (debug)
-          SplashBar --engine-flags  List the serve flags this engine accepts, and which get filtered (debug)
-          SplashBar --models     List locally available Splash packages as the Model submenu sees them (debug)
+          Splash-MLX --status     Show service state and current arguments
+          Splash-MLX --start      Start (detached session; survives quitting this app)
+          Splash-MLX --pause      Freeze the process group with SIGSTOP (memory stays held)
+          Splash-MLX --resume     Thaw with SIGCONT
+          Splash-MLX --stop       Stop (kill the whole process group)
+          Splash-MLX --restart    Restart
+          Splash-MLX --login-on   Register as a login item (launch Splash-MLX and start the service at login)
+          Splash-MLX --login-off  Unregister the login item
+          Splash-MLX --takeover   Kill the external process holding the port and take it over
+          Splash-MLX --states     Print the menu state-machine truth table plus the live state
+          Splash-MLX --dump-menu  Build the real menu and recursively print item availability (post-AppKit-validation)
+          Splash-MLX --version-of <path>  Run the version parser against an executable path (debug)
+          Splash-MLX --engine-flags  List the serve flags this engine accepts, and which get filtered (debug)
+          Splash-MLX --models     List locally available Splash packages as the Model submenu sees them (debug)
         """)
         return true
     default:

@@ -1,11 +1,11 @@
 #!/bin/zsh
-# SplashBar 构建脚本
+# SplashMLX 构建脚本
 #  1) 编译 makeicons.swift，生成菜单栏三态图标 + 应用图标(AppIcon.icns)
 #  2) 编译 main.swift 成常驻菜单栏的 .app（无窗口、无 Dock 图标）
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$HOME/Applications/SplashBar.app"
+APP_DIR="$HOME/Applications/SplashMLX.app"
 BIN_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
 OBJ_DIR="$SRC_DIR/.build"
@@ -28,11 +28,11 @@ cp "$OBJ_DIR"/menubar_*.png "$RES_DIR/"
 echo "[4/7] compile main app (AppKit)"
 xcrun swiftc -O -swift-version 5 -sdk "$SDK" \
   -target arm64-apple-macosx13.0 \
-  -o "$BIN_DIR/SplashBar" "$SRC_DIR/main.swift"
+  -o "$BIN_DIR/SplashMLX" "$SRC_DIR/main.swift"
 
 echo "[5/7] assemble .app bundle"
 cp "$SRC_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
-chmod +x "$BIN_DIR/SplashBar"
+chmod +x "$BIN_DIR/SplashMLX"
 
 echo "[6/7] clear quarantine + ad-hoc sign"
 xattr -dr com.apple.quarantine "$APP_DIR" 2>/dev/null || true
@@ -45,4 +45,4 @@ rm -rf "$OBJ_DIR"
 echo
 echo "✅ Build complete: $APP_DIR"
 echo "   resources: $(ls "$RES_DIR" | wc -l | tr -d ' ') files"
-echo "   launch: open ~/Applications/SplashBar.app"
+echo "   launch: open ~/Applications/SplashMLX.app"

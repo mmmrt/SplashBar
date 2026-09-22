@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key>
-  <string>SplashBar</string>
+  <string>Splash-MLX</string>
   <key>CFBundleDisplayName</key>
-  <string>SplashBar</string>
+  <string>Splash-MLX</string>
   <key>CFBundleIdentifier</key>
-  <string>com.mrt.splashbar</string>
+  <string>com.mrt.splash-mlx</string>
   <key>CFBundleExecutable</key>
-  <string>SplashBar</string>
+  <string>SplashMLX</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundlePackageType</key>

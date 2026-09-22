@@ -11,6 +11,16 @@ RES_DIR="$APP_DIR/Contents/Resources"
 OBJ_DIR="$SRC_DIR/.build"
 SDK="$(xcrun --show-sdk-path)"
 
+# 先退掉正在运行的实例，再重建。
+# 原因：对一个**正在运行**的 .app 执行 rm -rf 时，macOS 会把整个 bundle 挪进废纸篓，
+# 而旧进程继续从废纸篓里那份二进制运行 —— 结果就是"代码改了、也重新构建了、菜单栏却毫无变化"，
+# 而且从 ~/Applications 完全看不出异常（那里确实是新的）。pkill 一次就不会踩。
+if pgrep -f "$APP_DIR/Contents/MacOS/" >/dev/null 2>&1; then
+  echo "[0/7] quit the running instance (otherwise the old bundle ends up in the Trash)"
+  pkill -f "$APP_DIR/Contents/MacOS/" 2>/dev/null || true
+  sleep 1
+fi
+
 echo "[1/7] clean previous build"
 rm -rf "$OBJ_DIR" "$APP_DIR"
 mkdir -p "$OBJ_DIR" "$BIN_DIR" "$RES_DIR"

@@ -153,6 +153,9 @@ private let kTagMlxKvQuant    = 14
 private let kTagMlxPrefixDisk = 15
 private let kTagMlxResident   = 16
 private let kTagMlxIdle       = 17
+private let kTagMlxPrefixMem  = 21
+private let kTagMlxPrefixEnt  = 22
+private let kTagMlxResidentMem = 23
 private let kTagMlxDrafter    = 18
 private let kTagMlxVision     = 19
 private let kTagMlxMetrics    = 20
@@ -165,7 +168,10 @@ private let kMlxGatedParams: [(tag: Int, flag: String)] = [
     (kTagMlxCtx,        "--ctx-size"),
     (kTagMlxKvQuant,    "--kv-quant"),
     (kTagMlxPrefixDisk, "--prefix-cache-disk"),
+    (kTagMlxPrefixMem,  "--prefix-cache-mem"),
+    (kTagMlxPrefixEnt,  "--prefix-cache-entries"),
     (kTagMlxResident,   "--max-resident-models"),
+    (kTagMlxResidentMem, "--max-resident-mem"),
     (kTagMlxIdle,       "--idle-evict-secs"),
     (kTagMlxDrafter,    "--drafter"),
     (kTagMlxVision,     "--no-vision"),
@@ -279,7 +285,13 @@ struct MLXConfig: Codable {
     var kvQuant: String = "off"
     /// 前缀缓存落 SSD，如 "10GB"。留空=关闭
     var prefixCacheDisk: String = ""
+    /// 前缀缓存的**内存层**字节预算。引擎默认只有 2GB —— 大内存机器加大能显著提高命中率
+    var prefixCacheMem: String = ""
+    /// 前缀缓存的 LRU 条数上限（引擎默认 32）。和上面那个是同一缓存的两个维度
+    var prefixCacheEntries: String = ""
     var maxResidentModels: String = ""
+    /// 所有常驻模型的**总**内存上限。留空用引擎默认（wired limit 的 80%）
+    var maxResidentMem: String = ""
     var idleEvictSecs: String = ""
     var noVision: Bool = false
     /// 已废弃：--metrics 现在强制打开（运行信息栏依赖它），菜单里不再暴露。
@@ -308,7 +320,10 @@ struct MLXConfig: Codable {
         ctxSize           = (try? c.decode(String.self, forKey: .ctxSize)) ?? ctxSize
         kvQuant           = (try? c.decode(String.self, forKey: .kvQuant)) ?? kvQuant
         prefixCacheDisk   = (try? c.decode(String.self, forKey: .prefixCacheDisk)) ?? prefixCacheDisk
+        prefixCacheMem    = (try? c.decode(String.self, forKey: .prefixCacheMem)) ?? prefixCacheMem
+        prefixCacheEntries = (try? c.decode(String.self, forKey: .prefixCacheEntries)) ?? prefixCacheEntries
         maxResidentModels = (try? c.decode(String.self, forKey: .maxResidentModels)) ?? maxResidentModels
+        maxResidentMem    = (try? c.decode(String.self, forKey: .maxResidentMem)) ?? maxResidentMem
         idleEvictSecs     = (try? c.decode(String.self, forKey: .idleEvictSecs)) ?? idleEvictSecs
         noVision          = (try? c.decode(Bool.self, forKey: .noVision)) ?? noVision
         metrics           = (try? c.decode(Bool.self, forKey: .metrics)) ?? metrics
@@ -355,8 +370,17 @@ struct MLXConfig: Codable {
         if !prefixCacheDisk.isEmpty, Service.flagAvailable("--prefix-cache-disk") {
             a += ["--prefix-cache-disk", prefixCacheDisk]
         }
+        if !prefixCacheMem.isEmpty, Service.flagAvailable("--prefix-cache-mem") {
+            a += ["--prefix-cache-mem", prefixCacheMem]
+        }
+        if !prefixCacheEntries.isEmpty, Service.flagAvailable("--prefix-cache-entries") {
+            a += ["--prefix-cache-entries", prefixCacheEntries]
+        }
         if !maxResidentModels.isEmpty, Service.flagAvailable("--max-resident-models") {
             a += ["--max-resident-models", maxResidentModels]
+        }
+        if !maxResidentMem.isEmpty, Service.flagAvailable("--max-resident-mem") {
+            a += ["--max-resident-mem", maxResidentMem]
         }
         if !idleEvictSecs.isEmpty, Service.flagAvailable("--idle-evict-secs") {
             a += ["--idle-evict-secs", idleEvictSecs]
@@ -1354,10 +1378,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         items.append(gatedSubmenu("Bind address  --host", tag: kTagMlxHost, items: choiceItems(
             current: cfg.mlx.host,
-            // 安全的放最前，并说明 0.0.0.0 的代价 —— 别让人顺手就把它暴露出去
-            options: [("127.0.0.1", "127.0.0.1 — this Mac only (default)"),
-                      ("0.0.0.0", "0.0.0.0 — every device on your network"),
-                      ("", "Engine default (0.0.0.0 — not recommended)")],
+            // 只给"绑本机"。暴露到局域网既不是性能收益、又降低安全性，
+            // 按"只开放安全且有效益的项"的原则不放进菜单 —— 真需要就手改配置。
+            options: [("127.0.0.1", "127.0.0.1 — this Mac only (default)")],
             customLabel: "Custom… (e.g. 192.168.1.5)", tag: kTagMlxHost)))
 
         items.append(gatedSubmenu("Context  --ctx-size", tag: kTagMlxCtx, items: choiceItems(
@@ -1378,10 +1401,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                       ("4GB", "4GB"), ("10GB", "10GB"), ("32GB", "32GB")],
             customLabel: "Custom… (e.g. 10GB)", tag: kTagMlxPrefixDisk)))
 
+        // 内存层预算：引擎默认只给 2GB，大内存机器加大能明显提高命中率
+        items.append(gatedSubmenu("Prefix cache memory  --prefix-cache-mem", tag: kTagMlxPrefixMem, items: choiceItems(
+            current: cfg.mlx.prefixCacheMem,
+            options: [("", "Engine default (2GB)"),
+                      ("4GB", "4GB"), ("8GB", "8GB"), ("16GB", "16GB")],
+            customLabel: "Custom… (e.g. 6GB)", tag: kTagMlxPrefixMem)))
+
+        items.append(gatedSubmenu("Prefix cache entries  --prefix-cache-entries", tag: kTagMlxPrefixEnt, items: choiceItems(
+            current: cfg.mlx.prefixCacheEntries,
+            options: [("", "Engine default (32)"),
+                      ("64", "64"), ("128", "128"), ("256", "256")],
+            customLabel: "Custom… (count)", tag: kTagMlxPrefixEnt)))
+
         items.append(gatedSubmenu("Max resident models  --max-resident-models", tag: kTagMlxResident, items: choiceItems(
             current: cfg.mlx.maxResidentModels,
             options: [("", "Engine default (3)"), ("1", "1"), ("2", "2"), ("3", "3")],
             customLabel: "Custom…", tag: kTagMlxResident)))
+
+        // 所有常驻模型的「总」内存上限。选项刻意保守 —— 调太小会频繁驱逐、反而更慢
+        items.append(gatedSubmenu("Max resident memory  --max-resident-mem", tag: kTagMlxResidentMem, items: choiceItems(
+            current: cfg.mlx.maxResidentMem,
+            options: [("", "Engine default (80% of wired limit)"),
+                      ("48GB", "48GB"), ("64GB", "64GB"), ("96GB", "96GB")],
+            customLabel: "Custom… (e.g. 80GB)", tag: kTagMlxResidentMem)))
 
         items.append(gatedSubmenu("Idle evict  --idle-evict-secs", tag: kTagMlxIdle, items: choiceItems(
             current: cfg.mlx.idleEvictSecs,
@@ -1720,7 +1763,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case kTagMlxCtx:         cfg.mlx.ctxSize = v
         case kTagMlxKvQuant:     cfg.mlx.kvQuant = v
         case kTagMlxPrefixDisk:  cfg.mlx.prefixCacheDisk = v
+        case kTagMlxPrefixMem:   cfg.mlx.prefixCacheMem = v
+        case kTagMlxPrefixEnt:   cfg.mlx.prefixCacheEntries = v
         case kTagMlxResident:    cfg.mlx.maxResidentModels = v
+        case kTagMlxResidentMem: cfg.mlx.maxResidentMem = v
         case kTagMlxIdle:        cfg.mlx.idleEvictSecs = v
         case kTagMlxDrafter:     cfg.mlx.drafter = v
         case kTagMlxVision:      cfg.mlx.noVision = (v == "off")
@@ -1773,6 +1819,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case kTagMlxHost:        return ("Custom bind address", "e.g. 0.0.0.0 / 127.0.0.1", cfg.mlx.host)
         case kTagMlxCtx:         return ("Custom context size", "e.g. 32768 / 128K", cfg.mlx.ctxSize)
         case kTagMlxPrefixDisk:  return ("Custom prefix-cache SSD tier", "e.g. 10GB / 32GB", cfg.mlx.prefixCacheDisk)
+        case kTagMlxPrefixMem:   return ("Custom prefix-cache memory budget", "e.g. 4GB / 8GB", cfg.mlx.prefixCacheMem)
+        case kTagMlxPrefixEnt:   return ("Custom prefix-cache entries", "e.g. 64 / 128", cfg.mlx.prefixCacheEntries)
+        case kTagMlxResidentMem: return ("Custom total resident memory cap", "e.g. 64GB / 96GB", cfg.mlx.maxResidentMem)
         case kTagMlxResident:    return ("Custom max resident models", "e.g. 2", cfg.mlx.maxResidentModels)
         case kTagMlxIdle:        return ("Custom idle evict seconds", "e.g. 300", cfg.mlx.idleEvictSecs)
         case kTagMlxDrafter:     return ("Custom drafter directory",

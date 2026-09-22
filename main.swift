@@ -277,6 +277,8 @@ struct MLXConfig: Codable {
     var maxResidentModels: String = ""
     var idleEvictSecs: String = ""
     var noVision: Bool = false
+    /// 已废弃：--metrics 现在强制打开（运行信息栏依赖它），菜单里不再暴露。
+    /// 保留字段只是为了不破坏老配置文件的解码。
     var metrics: Bool = false
     var apiKey: String = ""
     /// Prompt Lookup Decoding（引擎默认开）
@@ -337,7 +339,10 @@ struct MLXConfig: Codable {
         }
         if !drafter.isEmpty, Service.flagAvailable("--drafter") { a += ["--drafter", drafter] }
         if noVision, Service.flagAvailable("--no-vision") { a += ["--no-vision"] }
-        if metrics, Service.flagAvailable("--metrics") { a += ["--metrics"] }
+        // --metrics 强制打开，不出现在菜单里。
+        // 原因：菜单的运行信息栏（tok/s、TTFT、内存）全部依赖 metrics 端点，
+        // 让用户关掉它只会得到一排 0 —— 那就不是"可选项"，是必需品。
+        if Service.flagAvailable("--metrics") { a += ["--metrics"] }
         if !enablePLD, Service.flagAvailable("--no-pld") { a += ["--no-pld"] }
         if noMTP, Service.flagAvailable("--no-mtp") { a += ["--no-mtp"] }
         if !apiKey.isEmpty, Service.flagAvailable("--api-key") { a += ["--api-key", apiKey] }
@@ -1284,11 +1289,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             offLabel: "Skip it --no-vision (saves memory)",
             tag: kTagMlxVision)))
 
-        items.append(gatedSubmenu("Metrics  --metrics", tag: kTagMlxMetrics, items: boolItems(
-            on: cfg.mlx.metrics,
-            onLabel: "On — Prometheus /metrics + index panel",
-            offLabel: "Off (default)",
-            tag: kTagMlxMetrics)))
+        // Metrics 不在这里出现：它被强制打开（见 MLXConfig.serveArguments）。
+        // 菜单的运行信息栏要靠它取数，做成开关只会让用户把自己看瞎。
 
         items.append(.separator())
         items.append(submenuItem("Model folder…", items: modelDirItems()))

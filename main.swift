@@ -581,6 +581,11 @@ struct Status {
     var gpuPct = 0.0
     var reqRunning = 0
     var reqWaiting = 0
+    /// tps 是「上次实测值」而不是本窗口实测时的年龄（秒）。-1 = 本窗口刚测到，是新鲜的。
+    /// mlx-serve 的计数器是累计量，5 秒窗口只能"撞上"生成过程 ——
+    /// 实测 900 token 的生成只占 1 个窗口，11 个窗口里 10 个算出来是 0。
+    /// 所以必须沿用上次实测值并标明年龄，否则菜单几乎永远显示 0。
+    var tpsStaleSeconds: Double = -1
 }
 
 /// JSONSerialization 给的是 NSNumber，`as? Double` 对整数值不可靠，统一走这里
@@ -843,7 +848,14 @@ enum Service {
 
     /// mlx-serve 的 `generation_tokens_total` 是**累计**值，没有现成的实时速率，
     /// 只能拿相邻两次采样求差。这是唯一需要跨调用保存的状态。
-    private static var lastMLXSample: (t: Date, tokens: Double)?
+    /// 上一次采样的 (输出 token 累计, 实际解码耗时累计)。
+    /// 用**解码耗时**而不是墙上时间做分母 —— 详见 status() 里的说明。
+    private static var lastMLXSample: (t: Date, tokens: Double, decodeSeconds: Double)?
+    /// 最近一次真正测到的非零速率。窗口一旦没撞上生成就会返回 0，
+    /// 靠它把上一个真实值留住，并在菜单里标出"多久之前测的"。
+    private static var lastMLXRate: (value: Double, at: Date)?
+    /// 超过这个年龄就不再显示速率（说明确实空闲了）
+    private static let kMLXRateMaxAge: Double = 30
 
     /// 状态探测。已暂停（进程冻结）时直接短路，避免每次轮询都等 curl 超时。
     static func status() -> Status {
@@ -872,7 +884,6 @@ enum Service {
             else { return s }
             s.metricsAvailable = true
             let g = (obj["gauges"] as? [String: Any]) ?? [:]
-            let c = (obj["counters"] as? [String: Any]) ?? [:]
             if let mb = num(g["memory_mb"]) { s.residentGB = mb / 1024.0 }
             if let gp = num(g["gpu_utilization_pct"]) { s.gpuPct = gp }
             if let n = num(g["requests_running"]) { s.reqRunning = Int(n) }
@@ -885,17 +896,37 @@ enum Service {
                 s.ttftP50 = sum / cnt * 1000.0
             }
             // 实时解码速度 = Δ(累计生成 token) / Δ(真实经过时间)
-            if let tot = num(c["generation_tokens_total"]) {
+            // 速率 = Δ(输出 token) / Δ(**实际解码耗时**)。
+            //
+            // 不用墙上时间做大分母：一次生成可能只跑 0.35 秒、却落在 5 秒的轮询窗口里，
+            // 那样算出来会被摊薄约 5 倍（实测真实 174 tok/s 会被显示成 116）。
+            // decode_time_seconds 只在真正解码时累加，所以比值就是真实解码速率。
+            if let h = obj["histograms"] as? [String: Any],
+               let otH = h["output_tokens"] as? [String: Any],
+               let dtH = h["decode_time_seconds"] as? [String: Any],
+               let otSum = num(otH["sum"]), let dtSum = num(dtH["sum"]) {
                 let now = Date()
                 if let prev = lastMLXSample {
-                    let dt = now.timeIntervalSince(prev.t)
-                    if dt >= 0.5 {
-                        let d = tot - prev.tokens
-                        s.tps = d >= 0 ? d / dt : 0
-                        lastMLXSample = (now, tot)
+                    let dTok = otSum - prev.tokens
+                    let dDec = dtSum - prev.decodeSeconds
+                    if dTok > 0, dDec > 0.05 {
+                        let rate = dTok / dDec
+                        lastMLXRate = (rate, now)
+                        s.tps = rate
                     }
+                    lastMLXSample = (now, otSum, dtSum)
                 } else {
-                    lastMLXSample = (now, tot)   // 第一次采样只记录基线
+                    lastMLXSample = (now, otSum, dtSum)   // 第一次采样只记录基线
+                }
+                // 本窗口没生成（绝大多数窗口都如此）：沿用上次实测值并标出年龄，
+                // 超过 kMLXRateMaxAge 才当真空闲。否则菜单几乎永远显示 0，
+                // 用户根本没机会看到真实的 tok/s。
+                if s.tps == 0, let lr = lastMLXRate {
+                    let age = now.timeIntervalSince(lr.at)
+                    if age <= kMLXRateMaxAge {
+                        s.tps = lr.value
+                        s.tpsStaleSeconds = age
+                    }
                 }
             }
             return s
@@ -1053,8 +1084,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if running {
             if activeEngine == .mlx {
                 if st.metricsAvailable {
-                    menu.addItem(disabled(String(format: "%.1f tok/s · GPU %.0f%% · memory %.1f GB",
-                                                 st.tps, st.gpuPct, st.residentGB)))
+                    menu.addItem(disabled(String(format: "%@ · GPU %.0f%% · memory %.1f GB",
+                                                 mlxSpeedLabel(), st.gpuPct, st.residentGB)))
                 } else {
                     menu.addItem(disabled("⏳ no metrics yet — model still loading?"))
                 }
@@ -1319,6 +1350,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         custom.tag = tag
         items.append(custom)
         return items
+    }
+
+    /// mlx-serve 的速率文案。
+    /// 它的计数是累计量、只能靠窗口差值算速率，而生成往往是突发的 ——
+    /// 实测 900 token 只占 1 个 5 秒窗口。所以窗口没撞上时给出**上次实测值 + 年龄**，
+    /// 而不是显示一个等于"这一格恰好没生成"的 0；真空闲了才写 idle。
+    private func mlxSpeedLabel() -> String {
+        guard st.tps > 0 else { return "idle" }
+        if st.tpsStaleSeconds < 0 { return String(format: "%.1f tok/s", st.tps) }
+        return String(format: "%.1f tok/s (%ds ago)", st.tps, Int(st.tpsStaleSeconds))
     }
 
     /// 当前引擎选中的模型。两个引擎各存各的，所以读写都要按引擎分发。
@@ -2036,8 +2077,11 @@ func runCLI(_ argv: [String]) -> Bool {
         if s.up {
             if activeEngine == .mlx {
                 if s.metricsAvailable {
-                    print(String(format: "speed:     %.1f tok/s · GPU %.0f%% · memory %.1f GB · %d running",
-                                 s.tps, s.gpuPct, s.residentGB, s.reqRunning))
+                    // 注意：CLI 每次都是新进程，没有上一次采样做基线，
+                    // 所以速率这里永远是 idle —— 要看真实速率得用菜单栏（它有常驻状态）。
+                    let sp = s.tps > 0 ? String(format: "%.1f tok/s", s.tps) : "idle"
+                    print(String(format: "speed:     %@ · GPU %.0f%% · memory %.1f GB · %d running",
+                                 sp, s.gpuPct, s.residentGB, s.reqRunning))
                 } else {
                     print("metrics:   unavailable — model not loaded yet?")
                 }

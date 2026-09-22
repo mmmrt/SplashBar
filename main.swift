@@ -864,9 +864,8 @@ enum Service {
     /// 靠它把上一个真实值留住，并在菜单里标出"多久之前测的"。
     private static var lastMLXRate: (value: Double, at: Date)?
     /// 超过这个年龄就不再显示速率（说明确实空闲了）
-    /// 生成结束后速率还保留多久。原来是 30 秒 —— 用户反馈"输出完了还挂好久"。
-    /// 5 秒足够读完最后一个数字，又不会让人觉得它赖着不走。
-    private static let kMLXRateMaxAge: Double = 5
+    /// 生成结束后速率还保留多久（用户指定 2 秒）。
+    private static let kMLXRateMaxAge: Double = 2
     /// live 计数的历史采样（约 6 秒窗口）。
     /// `generation_tokens_live` 的更新粒度约 1.6 秒 —— 用 1 秒轮询窗口算差值，
     /// 会一会儿是 0、一会儿一次吞掉一整批（实测显示 273、367，而真实只有 184）。
@@ -877,17 +876,10 @@ enum Service {
     static func status() -> Status {
         var s = Status()
         if paused { return s }
-        let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
-                                      baseURL + activeEngine.healthPath])
-        // mlx-serve 的 /health 返回 `{"status":"ok"}`（是 JSON，但结构完全不同），
-        // 所以不能套用下面 Splash /status 的解析：只要 curl 成功且响应非空就算活着。
         if activeEngine == .mlx {
-            // /health 只说明服务活着 —— 模型可能还在加载
-            if r.status == 0, !r.out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                s.up = true
-            }
-            // /metrics.json 才有数字。模型没加载完时它返回的是 mlx-serve 自己的
-            // 纯文本错误（upstream connect failed），解析不成字典 → metricsAvailable 保持 false
+            // 顺序很关键：**先取 /metrics.json**。它能解析出 gauges/counters 就同时证明了
+            // "服务活着"和"有数据"，于是这次轮询只需 1 个进程而不是 2 个
+            // —— 进程创建才是轮询开销的大头，这一下砍掉一半。
             let m = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
                                           baseURL + "/metrics.json"])
             // 这里有两种"没数据"的形态，必须都挡住：
@@ -897,7 +889,17 @@ enum Service {
             guard m.status == 0, let md = m.out.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: md) as? [String: Any],
                   obj["gauges"] != nil || obj["counters"] != nil
-            else { return s }
+            else {
+                // 拿不到 metrics（模型加载中 / 未开 metrics）：退回 /health 只判存活，
+                // 这样"引擎在跑但模型未就绪"仍能被正确识别
+                let h = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
+                                              baseURL + "/health"])
+                if h.status == 0, !h.out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    s.up = true
+                }
+                return s
+            }
+            s.up = true          // metrics 拿到了 —— 服务必然活着
             s.metricsAvailable = true
             let g = (obj["gauges"] as? [String: Any]) ?? [:]
             if let mb = num(g["memory_mb"]) { s.residentGB = mb / 1024.0 }
@@ -981,6 +983,9 @@ enum Service {
         }
         mlxLiveHistory.removeAll()
         lastMLXSample = nil   // 换回 Splash 时清掉，避免下次切回来算出离谱的差值
+        // Splash 的 /status 既报健康也报数据，同一个端点，所以这次请求在 Splash 路径下才需要
+        let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
+                                      baseURL + activeEngine.healthPath])
         guard r.status == 0,
               let data = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -1332,8 +1337,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         var text = ""
         if cfg.showModelName { text += " " + modelShortName() }
         if cfg.showSpeed, st.tps > 0 {
-            // 有模型名时用 · 隔开，否则两者会连成一片看不出边界
-            text += (text.isEmpty ? " " : " · ") + String(format: "%.0f t/s", st.tps)
+            // 有模型名时用 ｜ 隔开，否则两者会连成一片看不出边界
+            text += (text.isEmpty ? " " : " ｜ ") + String(format: "%.0f t/s", st.tps)
         }
 
         button.imagePosition = text.isEmpty ? .imageOnly : .imageLeading

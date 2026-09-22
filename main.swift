@@ -595,6 +595,49 @@ struct Status {
     var tpsStaleSeconds: Double = -1
 }
 
+/// 进程内 HTTP GET（同步包装 URLSession），返回 (状态, 响应体)。
+///
+/// 用来替代 `curl` 子进程：**每次轮询 fork+exec 一个 curl 才是开销的大头**
+/// （秒级轮询下约 1-3% CPU），而请求本身只是本机 loopback socket，微秒级。
+/// 状态码语义与原来的 curl 对齐：HTTP 200 → 0，其余原样返回。
+///
+/// 注意 `connectionProxyDictionary = [:]`：原来 curl 用 `--noproxy *` 绕过公司代理，
+/// 这里必须同样显式禁用，否则 127.0.0.1 的请求可能被代理拦走。
+private let kHTTP: URLSession = {
+    let c = URLSessionConfiguration.ephemeral
+    c.connectionProxyDictionary = [:]
+    c.requestCachePolicy = .reloadIgnoringLocalCacheData
+    c.timeoutIntervalForRequest = 2
+    c.timeoutIntervalForResource = 3
+    return URLSession(configuration: c)
+}()
+
+private func httpGet(_ url: String, timeout: TimeInterval = 2) -> (status: Int32, out: String) {
+    guard let u = URL(string: url) else { return (-1, "") }
+    var req = URLRequest(url: u)
+    req.timeoutInterval = timeout
+    let sem = DispatchSemaphore(value: 0)
+    var code: Int32 = -1
+    var body = ""
+    kHTTP.dataTask(with: req) { data, resp, _ in
+        if let h = resp as? HTTPURLResponse { code = Int32(h.statusCode) }
+        if let d = data { body = String(data: d, encoding: .utf8) ?? "" }
+        sem.signal()
+    }.resume()
+    if sem.wait(timeout: .now() + timeout + 0.5) == .timedOut { return (-1, "") }
+    return (code == 200 ? 0 : code, body)
+}
+
+/// 读进程累计 CPU 时间（纳秒）。**纯系统调用** —— 不联网、不起进程，
+/// 所以可以每秒都做，用来判断引擎忙不忙。
+private func cpuNanos(of pid: pid_t) -> UInt64? {
+    var info = proc_taskinfo()
+    let size = MemoryLayout<proc_taskinfo>.size
+    let r = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(size))
+    guard r == Int32(size) else { return nil }
+    return info.pti_total_user + info.pti_total_system
+}
+
 /// JSONSerialization 给的是 NSNumber，`as? Double` 对整数值不可靠，统一走这里
 private func num(_ v: Any?) -> Double? {
     if let n = v as? NSNumber { return n.doubleValue }
@@ -880,8 +923,7 @@ enum Service {
             // 顺序很关键：**先取 /metrics.json**。它能解析出 gauges/counters 就同时证明了
             // "服务活着"和"有数据"，于是这次轮询只需 1 个进程而不是 2 个
             // —— 进程创建才是轮询开销的大头，这一下砍掉一半。
-            let m = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
-                                          baseURL + "/metrics.json"])
+            let m = httpGet(baseURL + "/metrics.json")
             // 这里有两种"没数据"的形态，必须都挡住：
             //   1) 没开 --metrics  → 返回合法 JSON `{"error":"metrics not enabled …"}`
             //   2) 模型没加载完    → 返回纯文本 `upstream connect failed: …`
@@ -892,8 +934,7 @@ enum Service {
             else {
                 // 拿不到 metrics（模型加载中 / 未开 metrics）：退回 /health 只判存活，
                 // 这样"引擎在跑但模型未就绪"仍能被正确识别
-                let h = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
-                                              baseURL + "/health"])
+                let h = httpGet(baseURL + "/health")
                 if h.status == 0, !h.out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     s.up = true
                 }
@@ -984,8 +1025,7 @@ enum Service {
         mlxLiveHistory.removeAll()
         lastMLXSample = nil   // 换回 Splash 时清掉，避免下次切回来算出离谱的差值
         // Splash 的 /status 既报健康也报数据，同一个端点，所以这次请求在 Splash 路径下才需要
-        let r = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "2",
-                                      baseURL + activeEngine.healthPath])
+        let r = httpGet(baseURL + activeEngine.healthPath)
         guard r.status == 0,
               let data = r.out.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -1087,7 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
 
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.tick()
         }
         RunLoop.main.add(timer!, forMode: .common)
     }
@@ -1095,6 +1135,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationWillTerminate(_ aNotification: Notification) { timer?.invalidate() }
 
     /// 状态探测放到后台：curl 最长可能阻塞 2 秒，放主线程会让菜单卡顿
+    private var lastPollAt = Date.distantPast
+    private var lastEngineCPU: (at: Date, nanos: UInt64)?
+
+    /// 定时器每秒调一次，但**不是每次都真去请求**：
+    /// 引擎忙（正在生成）时保持 1 秒高频；空闲时降到 5 秒一次。
+    ///
+    /// 忙闲判断用引擎进程的 CPU 时间 —— 纯系统调用，比"发个请求看看"便宜几个数量级，
+    /// 所以可以每秒做。这样既不会漏掉生成的开始（最多迟 1 秒），
+    /// 又能在占绝大多数的空闲时间里把请求量砍到 1/5。
+    private func tick() {
+        let now = Date()
+        let interval: TimeInterval = engineBusy(now: now) ? 1.0 : 5.0
+        guard now.timeIntervalSince(lastPollAt) >= interval else { return }
+        lastPollAt = now
+        refresh()
+    }
+
+    /// 引擎进程 CPU 占用是否明显（阈值 25% 单核）。空闲时它的 CPU 时间几乎不涨。
+    private func engineBusy(now: Date) -> Bool {
+        guard let pid = Service.recordedPID, Service.isAlive(pid), let nanos = cpuNanos(of: pid) else {
+            lastEngineCPU = nil
+            return st.reqRunning > 0
+        }
+        guard let p = lastEngineCPU else {
+            lastEngineCPU = (now, nanos)      // 第一次只记基线
+            return st.reqRunning > 0
+        }
+        let dCPU = Double(nanos >= p.nanos ? nanos - p.nanos : 0) / 1e9
+        let dt = now.timeIntervalSince(p.at)
+        lastEngineCPU = (now, nanos)
+        if dt > 0, dCPU / dt > 0.25 { return true }
+        return st.reqRunning > 0
+    }
+
     func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let s = Service.status()

@@ -1441,7 +1441,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func modelShortName() -> String {
-        let short = cfg.model.split(separator: "/").last.map(String.init) ?? cfg.model
+        // **必须用按引擎分发的 currentModel**。
+        // 原来固定读 cfg.model（Splash 的字段）—— 于是切成 MLX 后，
+        // 菜单栏标题、信息栏、Model 子菜单标题全都还显示 Splash 的模型名
+        // （配置和勾号是对的，只有显示不会变），用户看到就是"换了模型但名字没变"。
+        let full = currentModel
+        let short = full.split(separator: "/").last.map(String.init) ?? full
         return short.replacingOccurrences(of: "-Splash", with: "")
     }
 
@@ -1471,7 +1476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 : NSAttributedString(string: text, attributes: [
                     .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)])
         }
-        button.toolTip = "Splash-MLX — \(cfg.model)"
+        button.toolTip = "Splash-MLX — \(currentModel)"
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -1963,7 +1968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         a.messageText = "Quit Splash-MLX?"
         a.informativeText = """
         Quitting will also stop the inference service:
-        \(cfg.model)
+        \(currentModel)
 
         Reopen Splash-MLX to start it again.
         """
@@ -2179,8 +2184,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         Menu-bar controller for the local Splash inference server
 
         Engine: running \(Service.runningVersion() ?? "—") · installed \(Service.installedVersion() ?? "—")
-        Model: \(cfg.model)
-        Args: \(cfg.serveArguments.joined(separator: " "))
+        Model: \(currentModel)
+        Args: \((activeEngine == .mlx ? cfg.mlx.serveArguments : cfg.serveArguments).joined(separator: " "))
         Process: \(Service.recordedPID.map(String.init) ?? "none")
         Config: \(configURL.path)
         Log: \(logErrPath)

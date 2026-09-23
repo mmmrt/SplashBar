@@ -121,6 +121,8 @@ private let kTagMaxImagePixels = 5
 private let kTagCacheDisk      = 6
 private let kTagAllowedHost    = 7
 private let kTagWebUI          = 8
+/// Splash 1.0.2 新增：服务级默认思考强度
+private let kTagReasoningEffort = 9
 
 /// 受引擎能力约束的参数：tag → 引擎上对应的长选项。
 ///
@@ -142,6 +144,7 @@ private let kGatedParams: [(tag: Int, flag: String)] = [
     (kTagCacheDisk,      "--max-cache-disk"),
     (kTagAllowedHost,    "--allowed-host"),
     (kTagWebUI,          "--no-webui"),
+    (kTagReasoningEffort, "--default-reasoning-effort"),
 ]
 
 /// mlx-serve 专属参数。tag 从 11 起编号，和 Splash 的 1–8 严格分开，
@@ -424,6 +427,8 @@ final class Config: Codable {
     var maxCacheDisk: String = ""
     /// 手动指定 Splash 的模型目录（空 = 按 install/paths.py 的规则自动判定）
     var modelDirSplash: String = ""
+    /// Splash 1.0.2：服务级默认思考强度（空 = 引擎/模型模板的默认）
+    var reasoningEffort: String = ""
     var noWebUI: Bool = false
     var loginItem: Bool = false
     var autoStartOnLaunch: Bool = false
@@ -450,6 +455,7 @@ final class Config: Codable {
         maxImagePixels    = (try? c.decode(String.self, forKey: .maxImagePixels)) ?? maxImagePixels
         maxCacheDisk      = (try? c.decode(String.self, forKey: .maxCacheDisk)) ?? maxCacheDisk
         modelDirSplash    = (try? c.decode(String.self, forKey: .modelDirSplash)) ?? modelDirSplash
+        reasoningEffort   = (try? c.decode(String.self, forKey: .reasoningEffort)) ?? reasoningEffort
         noWebUI           = (try? c.decode(Bool.self, forKey: .noWebUI)) ?? noWebUI
         loginItem         = (try? c.decode(Bool.self, forKey: .loginItem)) ?? loginItem
         autoStartOnLaunch = (try? c.decode(Bool.self, forKey: .autoStartOnLaunch)) ?? autoStartOnLaunch
@@ -512,6 +518,11 @@ final class Config: Codable {
             a += ["--allowed-host", allowedHost]
         }
         if noWebUI, Service.flagAvailable("--no-webui") { a += ["--no-webui"] }
+        // 思考强度：直接决定输出前的思考量，是最影响"手感快慢"的一项
+        // （none 基本不思考 → 明显更快）。留空则用引擎/模型模板的默认值。
+        if !reasoningEffort.isEmpty, Service.flagAvailable("--default-reasoning-effort") {
+            a += ["--default-reasoning-effort", reasoningEffort]
+        }
         return a
     }
 }
@@ -1137,6 +1148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// 状态探测放到后台：curl 最长可能阻塞 2 秒，放主线程会让菜单卡顿
     private var lastPollAt = Date.distantPast
     private var lastEngineCPU: (at: Date, nanos: UInt64)?
+    /// 最近一次检测到引擎在忙的时刻。菜单栏的速度显示靠它决定何时隐藏 ——
+    /// 两个引擎统一走这个规则。
+    private var lastBusyAt = Date.distantPast
+    /// 上一次写进按钮标题的文字，用来跳过无变化的重复写入
+    private var lastButtonText = ""
 
     /// 定时器每秒调一次，但**不是每次都真去请求**：
     /// 引擎忙（正在生成）时保持 1 秒高频；空闲时降到 5 秒一次。
@@ -1146,7 +1162,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// 又能在占绝大多数的空闲时间里把请求量砍到 1/5。
     private func tick() {
         let now = Date()
-        let interval: TimeInterval = engineBusy(now: now) ? 1.0 : 5.0
+        let busy = engineBusy(now: now)
+        if busy { lastBusyAt = now }
+        // 按钮标题每秒都重算一次：空闲时轮询降到 5 秒，若只靠 refresh() 更新，
+        // "忙完 2 秒隐藏"会被拖成最多 5 秒才生效。只改标题，代价可忽略。
+        applyStatusButton()
+        let interval: TimeInterval = busy ? 1.0 : 5.0
         guard now.timeIntervalSince(lastPollAt) >= interval else { return }
         lastPollAt = now
         refresh()
@@ -1313,6 +1334,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 customLabel: "Custom… (pixel count)", tag: kTagMaxImagePixels)),
             // 这一项不是 CLI 参数：Splash-MLX 通过环境变量注入（--api-key 的 default 就是它）
             submenuItem("API Key  $SPLASH_API_KEY", items: apiKeyItems()),
+            gatedSubmenu("Reasoning effort  --default-reasoning-effort", tag: kTagReasoningEffort, items: choiceItems(
+                current: cfg.reasoningEffort,
+                options: [("", "Engine default"),
+                          ("none", "none — no thinking (fastest)"),
+                          ("minimal", "minimal"), ("low", "low"),
+                          ("medium", "medium"), ("high", "high")],
+                customLabel: "Custom… (xhigh / max)", tag: kTagReasoningEffort)),
             gatedSubmenu("Allowed host  --allowed-host", tag: kTagAllowedHost, items: hostItems()),
             gatedSubmenu("Web UI  --no-webui", tag: kTagWebUI, items: webUIItems()),
             // 实验特性放最后：正式版引擎不认识这个 flag
@@ -1410,7 +1438,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // 所以菜单栏是**间歇性变宽**，而不是常驻变宽。
         var text = ""
         if cfg.showModelName { text += " " + modelShortName() }
-        if cfg.showSpeed, st.tps > 0 {
+        // 统一规则：只在"引擎忙 + 结束后 2 秒"内显示速度。
+        // 不能只看 st.tps > 0 —— Splash 的 /status 报的是它自己的平滑值、**永不归零**，
+        // 那样速度会常驻菜单栏（MLX 侧有 2 秒保留期兜着，所以只有 Splash 会露出这个问题）。
+        let recentlyBusy = Date().timeIntervalSince(lastBusyAt) <= 2.0
+        if cfg.showSpeed, st.tps > 0, recentlyBusy {
             // 有模型名时用 ｜ 隔开，否则两者会连成一片看不出边界
             text += (text.isEmpty ? " " : " ｜ ") + String(format: "%.0f t/s", st.tps)
         }
@@ -1418,10 +1450,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         button.imagePosition = text.isEmpty ? .imageOnly : .imageLeading
         // 等宽数字：比例字体下 "174" 和 "99" 宽度不同，每秒变一次会让整个图标左右跳。
         // 11pt 也比菜单栏默认字号小一点，配合 "t/s" 的缩写控制占宽。
-        button.attributedTitle = text.isEmpty
-            ? NSAttributedString(string: "")
-            : NSAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)])
+        if text != lastButtonText {            // 不变就不重设，免得每秒无谓重绘
+            lastButtonText = text
+            button.attributedTitle = text.isEmpty
+                ? NSAttributedString(string: "")
+                : NSAttributedString(string: text, attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)])
+        }
         button.toolTip = "Splash-MLX — \(cfg.model)"
     }
 
@@ -1982,6 +2017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case kTagMaxRequestSize: cfg.maxRequestSize = v
         case kTagMaxImagePixels: cfg.maxImagePixels = v
         case kTagCacheDisk:      cfg.maxCacheDisk = v
+        case kTagReasoningEffort: cfg.reasoningEffort = v
         // ── MLX 专属（写入 cfg.mlx，与 Splash 那套完全隔离）
         case kTagMlxPort:        cfg.mlx.port = v
         case kTagMlxHost:        cfg.mlx.host = v
@@ -2039,6 +2075,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case kTagMaxRequestSize: return ("Custom max request size", "e.g. 64M / 1G", cfg.maxRequestSize)
         case kTagMaxImagePixels: return ("Custom max image pixels", "integer pixel count, e.g. 4194304", cfg.maxImagePixels)
         case kTagCacheDisk:      return ("Custom max cache disk", "e.g. 8G / 12G / 64G", cfg.maxCacheDisk)
+        case kTagReasoningEffort: return ("Custom reasoning effort", "none / minimal / low / medium / high / xhigh / max", cfg.reasoningEffort)
         // ── MLX 专属
         case kTagMlxPort:        return ("Custom port", "1-65535, e.g. 11235", cfg.mlx.port)
         case kTagMlxHost:        return ("Custom bind address", "e.g. 0.0.0.0 / 127.0.0.1", cfg.mlx.host)
@@ -2251,7 +2288,9 @@ func runCLI(_ argv: [String]) -> Bool {
         let s = Service.status()
         print("config:    \(configURL.path)")
         print("engine:    running \(Service.runningVersion() ?? "—") · installed \(Service.installedVersion() ?? "—")")
-        print("model:     \(cfg.model)")
+        // 按引擎取模型名 —— 原来固定打印 cfg.model（Splash 的字段），
+        // 导致跑着 MLX 时 status 里显示的却是 Splash 的模型
+        print("model:     \(activeEngine == .mlx ? cfg.mlx.model : cfg.model)")
         print("args:      \(cfg.serveArguments.joined(separator: " "))")
         let state = Service.paused ? "paused"
                   : (s.up ? (Service.managed ? "running (managed)" : "running (external)") : "stopped")
@@ -2405,7 +2444,12 @@ func runCLI(_ argv: [String]) -> Bool {
         // 单次 --status 永远测不出来（那是新进程、没有 lastMLXSample）。
         print("polling Service.status() while a generation runs…")
         DispatchQueue.global().async {
-            let body = #"{"model":"Qwen3.6-35B-A3B-MLX-Serve-4bit","messages":[{"role":"user","content":"Count from 1 to 40."}],"max_tokens":60}"#
+            // 用当前引擎真实的模型名：MLX 的 API 只认不带 org 的仓库名，
+            // Splash 认完整的 owner/repo。原来硬编码 MLX 的名字，切到 Splash 就必然被拒。
+            let apiModel = activeEngine == .mlx
+                ? String(cfg.mlx.model.split(separator: "/").last ?? "")
+                : cfg.model
+            let body = "{\"model\":\"" + apiModel + "\",\"messages\":[{\"role\":\"user\",\"content\":\"Count from 1 to 40.\"}],\"max_tokens\":60}"
             _ = run("/usr/bin/curl", ["-s", "--noproxy", "*", "--max-time", "120",
                                       "-X", "POST", "-H", "Content-Type: application/json",
                                       "-d", body, baseURL + "/v1/chat/completions"])

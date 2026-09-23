@@ -1045,6 +1045,20 @@ enum Service {
         s.up = true
         s.maxContext = (obj["maximum_context_tokens"] as? Int) ?? 0
         s.memoryPressure = (obj["memory_pressure"] as? String) ?? ""
+        // Splash 的推理**全在 GPU 上**：实测生成期间它的进程 CPU 只有 0.1%（空闲 0.0%），
+        // 所以"引擎忙不忙"绝不能靠 CPU 判断 —— 那会让菜单栏的速度永远不显示。
+        // 它自己就报了调度状态，直接读：
+        //   scheduler.decoding / .prefilling / .queued  正在解码/预填充/排队的请求数
+        //   frontend.active                             前端还没交给调度器的活跃请求
+        // 两者取较大值（有重叠，不能相加）。
+        let sched: Int = {
+            guard let sc = obj["scheduler"] as? [String: Any] else { return 0 }
+            return ((sc["decoding"] as? Int) ?? 0)
+                 + ((sc["prefilling"] as? Int) ?? 0)
+                 + ((sc["queued"] as? Int) ?? 0)
+        }()
+        let frontendActive = ((obj["frontend"] as? [String: Any])?["active"] as? Int) ?? 0
+        s.reqRunning = max(sched, frontendActive)
         if let m = obj["metrics"] as? [String: Any] {
             if let d = m["decode_tokens_per_second"] as? Double { s.tps = d }
             if let d = m["draft_acceptance_rate"] as? Double { s.accept = d }
